@@ -19,12 +19,16 @@ public struct SkillGrant: Sendable, Equatable {
     public let caller: CallerClass
     public let capabilities: Set<Capability>
     public let expiresAtMillis: Int64
+    /// Whose grant this is (user or device id). The ``Gateway`` scopes idempotency records to
+    /// it; `nil` scopes them to the token instead.
+    public let principal: String?
 
-    public init(skillID: String, caller: CallerClass, capabilities: Set<Capability>, expiresAtMillis: Int64) {
+    public init(skillID: String, caller: CallerClass, capabilities: Set<Capability>, expiresAtMillis: Int64, principal: String? = nil) {
         self.skillID = skillID
         self.caller = caller
         self.capabilities = capabilities
         self.expiresAtMillis = expiresAtMillis
+        self.principal = principal
     }
 }
 

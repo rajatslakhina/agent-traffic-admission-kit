@@ -184,3 +184,24 @@ final class SuccessPercentTextTests: XCTestCase {
         XCTAssertEqual(r.successPercentText, "0.0%")
     }
 }
+
+final class IntentKeyCacheTests: XCTestCase {
+    func testSameIntentGetsTheSameKeyAcrossInvocationsUntilClearedOrExpired() {
+        var cache = IntentKeyCache(windowMillis: 1_000, capacity: 8)
+        let first = cache.key(for: "reorder:usual", now: 0)
+        XCTAssertEqual(cache.key(for: "reorder:usual", now: 999), first, "a retry inside the window reuses the key")
+        XCTAssertNotEqual(cache.key(for: "reorder:other", now: 10), first)
+        cache.clear("reorder:usual")
+        let afterSuccess = cache.key(for: "reorder:usual", now: 20)
+        XCTAssertNotEqual(afterSuccess, first, "a new intent after success gets a new key")
+        XCTAssertNotEqual(cache.key(for: "reorder:usual", now: 1_020), afterSuccess, "the window ends")
+    }
+
+    func testCapacityIsBoundedAndClockGoingBackwardsReMints() {
+        var cache = IntentKeyCache(windowMillis: 10_000, capacity: 3)
+        for i in 0..<10 { _ = cache.key(for: "s\(i)", now: Int64(i)) }
+        XCTAssertEqual(cache.count, 3)
+        let k = cache.key(for: "x", now: 100)
+        XCTAssertNotEqual(cache.key(for: "x", now: 50), k)
+    }
+}

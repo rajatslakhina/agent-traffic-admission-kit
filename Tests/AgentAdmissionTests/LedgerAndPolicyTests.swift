@@ -8,7 +8,7 @@ private func key(_ s: String) -> IdempotencyKey {
 
 final class IdempotencyLedgerTests: XCTestCase {
     func testCompletedKeyReplaysUntilTTLThenIsForgotten() {
-        var ledger = IdempotencyLedger<Int>(capacity: 4, ttlMillis: 1_000)
+        var ledger = IdempotencyLedger<IdempotencyKey, Int>(capacity: 4, ttlMillis: 1_000)
         XCTAssertEqual(ledger.begin(key("a"), fingerprint: "f", now: 0), .started)
         ledger.complete(key("a"), value: 42, now: 100)
         guard case let .replay(v) = ledger.lookup(key("a"), fingerprint: "f", now: 1_099) else { return XCTFail("expected replay") }
@@ -19,7 +19,7 @@ final class IdempotencyLedgerTests: XCTestCase {
     }
 
     func testSameKeyDifferentPayloadIsAConflictNotAReplay() {
-        var ledger = IdempotencyLedger<Int>(capacity: 4, ttlMillis: 1_000)
+        var ledger = IdempotencyLedger<IdempotencyKey, Int>(capacity: 4, ttlMillis: 1_000)
         _ = ledger.begin(key("a"), fingerprint: "order-1", now: 0)
         guard case .conflict = ledger.lookup(key("a"), fingerprint: "order-2", now: 1) else { return XCTFail("in-flight conflict") }
         ledger.complete(key("a"), value: 1, now: 2)
@@ -27,7 +27,7 @@ final class IdempotencyLedgerTests: XCTestCase {
     }
 
     func testInFlightEntriesAreNeverEvictedSoAFullLedgerRefuses() {
-        var ledger = IdempotencyLedger<Int>(capacity: 2, ttlMillis: 1_000)
+        var ledger = IdempotencyLedger<IdempotencyKey, Int>(capacity: 2, ttlMillis: 1_000)
         XCTAssertEqual(ledger.begin(key("a"), fingerprint: "f", now: 0), .started)
         XCTAssertEqual(ledger.begin(key("b"), fingerprint: "f", now: 0), .started)
         XCTAssertEqual(ledger.begin(key("c"), fingerprint: "f", now: 0), .full)
@@ -35,19 +35,24 @@ final class IdempotencyLedgerTests: XCTestCase {
         guard case .inFlight = ledger.lookup(key("b"), fingerprint: "f", now: 0) else { return XCTFail("b must survive") }
     }
 
-    func testFullLedgerEvictsTheEarliestExpiringCompletedEntry() {
-        var ledger = IdempotencyLedger<Int>(capacity: 2, ttlMillis: 1_000)
-        _ = ledger.begin(key("old"), fingerprint: "f", now: 0)
-        ledger.complete(key("old"), value: 1, now: 0)
+    /// Evicting an unexpired completed record would turn the retry of a lost response into a
+    /// second execution, so a full ledger refuses instead and only reclaims expired records.
+    func testFullLedgerNeverEvictsAnUnexpiredCompletedRecord() {
+        var ledger = IdempotencyLedger<IdempotencyKey, Int>(capacity: 2, ttlMillis: 1_000)
+        _ = ledger.begin(key("paid"), fingerprint: "f", now: 0)
+        ledger.complete(key("paid"), value: 1, now: 0)
         _ = ledger.begin(key("busy"), fingerprint: "f", now: 10)
-        XCTAssertEqual(ledger.begin(key("new"), fingerprint: "f", now: 20), .started)
-        XCTAssertEqual(ledger.count, 2)
-        guard case .absent = ledger.lookup(key("old"), fingerprint: "f", now: 20) else { return XCTFail("old should be evicted") }
-        guard case .inFlight = ledger.lookup(key("busy"), fingerprint: "f", now: 20) else { return XCTFail("busy must survive") }
+        XCTAssertEqual(ledger.begin(key("new"), fingerprint: "f", now: 20), .full)
+        guard case .replay(1) = ledger.lookup(key("paid"), fingerprint: "f", now: 20) else {
+            return XCTFail("the completed record must still replay")
+        }
+        // Once "paid" expires its slot can be reclaimed.
+        XCTAssertEqual(ledger.begin(key("new"), fingerprint: "f", now: 1_000), .started)
+        guard case .absent = ledger.lookup(key("paid"), fingerprint: "f", now: 1_000) else { return XCTFail("expired") }
     }
 
     func testAbandonFreesAnInFlightKeyButNotACompletedOne() {
-        var ledger = IdempotencyLedger<Int>(capacity: 4, ttlMillis: 1_000)
+        var ledger = IdempotencyLedger<IdempotencyKey, Int>(capacity: 4, ttlMillis: 1_000)
         _ = ledger.begin(key("a"), fingerprint: "f", now: 0)
         ledger.abandon(key("a"))
         guard case .absent = ledger.lookup(key("a"), fingerprint: "f", now: 0) else { return XCTFail("abandoned key should be absent") }
@@ -58,7 +63,7 @@ final class IdempotencyLedgerTests: XCTestCase {
     }
 
     func testBeginTwiceIsRefusedAndCompleteOnUnknownKeyIsIgnored() {
-        var ledger = IdempotencyLedger<Int>(capacity: 4, ttlMillis: 1_000)
+        var ledger = IdempotencyLedger<IdempotencyKey, Int>(capacity: 4, ttlMillis: 1_000)
         _ = ledger.begin(key("a"), fingerprint: "f", now: 0)
         XCTAssertEqual(ledger.begin(key("a"), fingerprint: "f", now: 0), .alreadyPresent)
         ledger.complete(key("zzz"), value: 1, now: 0)
@@ -66,7 +71,7 @@ final class IdempotencyLedgerTests: XCTestCase {
     }
 
     func testHugeTTLSaturatesInsteadOfOverflowing() {
-        var ledger = IdempotencyLedger<Int>(capacity: 1, ttlMillis: .max)
+        var ledger = IdempotencyLedger<IdempotencyKey, Int>(capacity: 1, ttlMillis: .max)
         _ = ledger.begin(key("a"), fingerprint: "f", now: .max - 1)
         ledger.complete(key("a"), value: 1, now: .max - 1)
         guard case .replay = ledger.lookup(key("a"), fingerprint: "f", now: .max - 1) else { return XCTFail("expected replay") }
@@ -96,6 +101,9 @@ final class ClassAwarePolicyTests: XCTestCase {
         }
         XCTAssertTrue(admitted(TrafficClass(.siriAgent, .read), depth: 1))
         XCTAssertFalse(admitted(TrafficClass(.siriAgent, .read), depth: 2))
+        XCTAssertTrue(admitted(TrafficClass(.widget, .read), depth: 3))
+        XCTAssertFalse(admitted(TrafficClass(.widget, .read), depth: 4))
+        XCTAssertFalse(admitted(TrafficClass(.widget, .write), depth: 4))
         XCTAssertTrue(admitted(TrafficClass(.siriAgent, .write), depth: 5))
         XCTAssertFalse(admitted(TrafficClass(.shortcut, .write), depth: 6))
         XCTAssertTrue(admitted(TrafficClass(.interactiveUI, .write), depth: 7))

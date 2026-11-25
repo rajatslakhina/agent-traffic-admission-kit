@@ -35,8 +35,9 @@ public struct TrafficProfile: Sendable, Equatable {
         self.writeServiceMillis = Saturating.clamp(writeServiceMillis, 1, 60_000)
         self.clientTimeoutMillis = Saturating.clamp(clientTimeoutMillis, 1, 600_000)
         self.baselineRates = baselineRates.mapValues { $0.isNaN ? 0 : min(max(0, $0), 10_000) }
-        self.burstStartSecond = max(0, burstStartSecond)
-        self.burstEndSecond = max(self.burstStartSecond, burstEndSecond)
+        // Clamped into the run, so `seconds × 1_000` can never overflow.
+        self.burstStartSecond = min(max(0, burstStartSecond), self.durationSeconds)
+        self.burstEndSecond = min(max(self.burstStartSecond, burstEndSecond), self.durationSeconds)
         self.burstMultiplier = burstMultiplier.isFinite ? min(max(0, burstMultiplier), 1_000) : 1
         self.responseLossRate = responseLossRate.isFinite ? min(max(0, responseLossRate), 0.5) : 0
         self.seed = seed
@@ -73,7 +74,9 @@ public struct TrafficProfile: Sendable, Equatable {
 
     func rate(for traffic: TrafficClass, atMillis t: Int64) -> Double {
         let base = baselineRates[traffic] ?? 0
-        let inBurst = t >= Int64(burstStartSecond) * 1_000 && t < Int64(burstEndSecond) * 1_000
+        let start = Saturating.multiply(Int64(burstStartSecond), 1_000)
+        let end = Saturating.multiply(Int64(burstEndSecond), 1_000)
+        let inBurst = t >= start && t < end
         return inBurst && traffic.caller.isAgentOriginated ? base * burstMultiplier : base
     }
 }
@@ -87,18 +90,24 @@ public struct SimulationSetup: Sendable, Equatable {
 
     public var name: String
     public var policy: PolicyChoice
-    /// Clients send one key per intent and the server dedupes on it.
+    /// Clients send one key per write intent and the server dedupes on it. Reads carry no key.
     public var idempotencyKeys: Bool
     public var agentRetry: RetryPolicy
     /// A person who sees an error taps again once. Widgets never retry on their own.
     public var interactiveRetry: RetryPolicy
     /// Skip queued work whose client has already stopped waiting. Safe because it never ran.
     public var dropExpiredOnDequeue: Bool
+    /// The simulated server's ``IdempotencyLedger`` (the shipped type, keyed by intent).
+    public var ledgerCapacity: Int
+    public var ledgerTTLMillis: Int64
 
     public init(
         name: String, policy: PolicyChoice, idempotencyKeys: Bool, agentRetry: RetryPolicy,
-        interactiveRetry: RetryPolicy = .personTapsAgain, dropExpiredOnDequeue: Bool
+        interactiveRetry: RetryPolicy = .personTapsAgain, dropExpiredOnDequeue: Bool,
+        ledgerCapacity: Int = 100_000, ledgerTTLMillis: Int64 = 10 * 60 * 1_000
     ) {
+        self.ledgerCapacity = ledgerCapacity
+        self.ledgerTTLMillis = ledgerTTLMillis
         self.name = name
         self.policy = policy
         self.idempotencyKeys = idempotencyKeys
@@ -125,34 +134,43 @@ public struct ClassReport: Sendable, Equatable, Identifiable {
     public var id: TrafficClass { traffic }
     public let traffic: TrafficClass
     /// Distinct intents (first attempts).
-    public var intents = 0
-    public var succeeded = 0
-    public var attempts = 0
-    public var shed = 0
-    public var timedOut = 0
+    public internal(set) var intents = 0
+    public internal(set) var succeeded = 0
+    public internal(set) var attempts = 0
+    public internal(set) var shed = 0
+    public internal(set) var timedOut = 0
     /// Retries answered from the idempotency ledger (completed replay or joined in-flight).
-    public var replayed = 0
+    public internal(set) var replayed = 0
     /// Queued work skipped because its client had already stopped waiting.
-    public var droppedExpired = 0
+    public internal(set) var droppedExpired = 0
     /// Successful responses lost in transit (the client saw a timeout instead).
-    public var lostResponses = 0
+    public internal(set) var lostResponses = 0
     /// Handler executions.
-    public var executions = 0
+    public internal(set) var executions = 0
     /// Executions beyond the first for the same intent. For writes, each one is a double charge.
-    public var duplicateExecutions = 0
+    public internal(set) var duplicateExecutions = 0
     /// End-to-end latency (first attempt → success), sorted ascending.
-    public var latencies: [Int64] = []
+    public internal(set) var latencies: [Int64] = []
 
     public init(traffic: TrafficClass) { self.traffic = traffic }
 
-    public var failed: Int { intents - succeeded }
-    public var successRate: Double { intents == 0 ? 1 : Double(succeeded) / Double(intents) }
+    public var failed: Int { max(0, intents) - min(max(0, succeeded), max(0, intents)) }
+    public var successRate: Double { intents <= 0 ? 1 : Double(min(max(0, succeeded), intents)) / Double(intents) }
     public func percentile(_ p: Double) -> Int64? { Percentile.nearestRank(latencies, p) }
     /// Success rate for display, rounded **down** to 0.1%, so "100%" appears only when every
     /// intent succeeded and a 99.96% run can't round itself up to perfect.
     public var successPercentText: String {
         guard intents > 0, succeeded < intents else { return "100%" }
-        let tenths = (succeeded * 1_000) / intents
+        let ok = Int64(max(0, succeeded))
+        let (scaled, overflow) = ok.multipliedReportingOverflow(by: 1_000)
+        var tenths: Int64
+        if overflow {
+            tenths = Saturating.int64((Double(ok) / Double(intents) * 1_000).rounded(.down))
+        } else {
+            tenths = Saturating.divide(scaled, Int64(intents)) ?? 0
+        }
+        // succeeded < intents here, so never print a perfect score.
+        tenths = Saturating.clamp(tenths, 0, 999)
         return "\(tenths / 10).\(tenths % 10)%"
     }
 
@@ -282,8 +300,8 @@ private struct Engine {
         var waitingUntil: Int64 = .min
         var done = false
         var executions = 0
+        /// The job currently holding this intent's ledger claim.
         var inFlightJob: Int?
-        var completedInLedger = false
     }
 
     struct Job {
@@ -331,6 +349,7 @@ private struct Engine {
     var timeline: [Int: SecondSample] = [:]
     var truncated = false
     let meanService: Int64
+    var ledger: IdempotencyLedger<Int, Void>
 
     init(profile: TrafficProfile, setup: SimulationSetup) {
         self.profile = profile
@@ -341,6 +360,7 @@ private struct Engine {
         case let .classAware(config): policy = .aware(ClassAwarePolicy(configuration: config, now: 0))
         }
         freeWorkers = profile.workers
+        ledger = IdempotencyLedger(capacity: setup.ledgerCapacity, ttlMillis: setup.ledgerTTLMillis)
         meanService = max(1, (profile.readServiceMillis + profile.writeServiceMillis) / 2)
         for t in TrafficClass.all { reports[t] = ClassReport(traffic: t) }
     }
@@ -353,7 +373,11 @@ private struct Engine {
 
     mutating func generateArrivals() {
         let end = Int64(profile.durationSeconds) * 1_000
-        var boundaries: [Int64] = [Int64(profile.burstStartSecond) * 1_000, Int64(profile.burstEndSecond) * 1_000, end]
+        var boundaries: [Int64] = [
+            Saturating.multiply(Int64(profile.burstStartSecond), 1_000),
+            Saturating.multiply(Int64(profile.burstEndSecond), 1_000),
+            end
+        ]
         boundaries = boundaries.filter { $0 > 0 && $0 <= end }.sorted()
         var arrivals: [(Int64, TrafficClass)] = []
         for traffic in TrafficClass.all {
@@ -425,16 +449,18 @@ private struct Engine {
         schedule(intents[i].waitingUntil, .timeout(intent: i, attempt: attempt))
         reports[traffic]?.attempts += 1
 
-        if setup.idempotencyKeys {
-            if intents[i].completedInLedger {
+        if keyed(i) {
+            switch ledger.lookup(i, fingerprint: "", now: now) {
+            case .replay:
                 reports[traffic]?.replayed += 1
                 succeed(i, now: now)
                 return
-            }
-            if intents[i].inFlightJob != nil {
+            case .inFlight:
                 // Joined: the in-flight execution will answer this attempt too.
                 reports[traffic]?.replayed += 1
                 return
+            case .absent, .conflict:
+                break
             }
         }
 
@@ -447,14 +473,25 @@ private struct Engine {
             }
             failAttempt(i, attempt: attempt, retryAfter: retryAfter, now: now)
         case let .admit(priority):
+            if keyed(i), ledger.begin(i, fingerprint: "", now: now) != .started {
+                // Ledger full of live records: shed rather than run unprotected.
+                reports[traffic]?.shed += 1
+                failAttempt(i, attempt: attempt, retryAfter: 250, now: now)
+                return
+            }
             let job = Job(id: jobs.count, intent: i, attempt: attempt, priority: priority, seq: nextSeq(), service: profile.serviceMillis(for: traffic.kind))
             jobs.append(job)
-            if setup.idempotencyKeys { intents[i].inFlightJob = jobs.count - 1 }
+            if keyed(i) { intents[i].inFlightJob = job.id }
             queue.push(job)
             let depth = queue.count
             sample(now) { $0.maxQueueDepth = max($0.maxQueueDepth, depth) }
             dispatch(now: now)
         }
+    }
+
+    /// Writes carry an idempotency key when the setup uses keys; reads never do (as with the Gateway).
+    func keyed(_ i: Int) -> Bool {
+        setup.idempotencyKeys && intents.indices.contains(i) && intents[i].traffic.kind == .write
     }
 
     mutating func timeOut(_ i: Int, attempt: Int, now: Int64) {
@@ -495,11 +532,11 @@ private struct Engine {
         freeWorkers += 1
         let job = jobs[j]
         let i = job.intent
-        if setup.idempotencyKeys {
-            if intents[i].inFlightJob == j { intents[i].inFlightJob = nil }
-            intents[i].completedInLedger = true
+        if keyed(i), intents[i].inFlightJob == j {
+            intents[i].inFlightJob = nil
+            ledger.complete(i, value: (), now: now)
         }
-        let answersCurrent = setup.idempotencyKeys || job.attempt == intents[i].attempt
+        let answersCurrent = keyed(i) || job.attempt == intents[i].attempt
         if !intents[i].done, answersCurrent, now <= intents[i].waitingUntil {
             if profile.responseLossRate > 0, rng.nextUnit() < profile.responseLossRate {
                 // Committed server-side, but the client never hears back; its timeout will fire.
@@ -518,11 +555,12 @@ private struct Engine {
             if setup.dropExpiredOnDequeue {
                 let stale = intents[i].done
                     || intents[i].waitingUntil < now
-                    || (!setup.idempotencyKeys && job.attempt != intents[i].attempt)
+                    || (!keyed(i) && job.attempt != intents[i].attempt)
                 if stale {
                     // Never executed, so dropping is safe. Release the claim so a later retry runs it.
                     if intents[i].inFlightJob == job.id {
                         intents[i].inFlightJob = nil
+                        ledger.abandon(i)
                     }
                     reports[intents[i].traffic]?.droppedExpired += 1
                     continue

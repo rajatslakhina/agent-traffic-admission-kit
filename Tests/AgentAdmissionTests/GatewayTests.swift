@@ -26,7 +26,9 @@ final class GatewayTests: XCTestCase {
     }
 
     func testFiftyConcurrentRetriesOfOneWriteExecuteTheHandlerOnce() async throws {
-        let (gateway, _) = makeGateway()
+        var config = Gateway<Int>.Configuration()
+        config.maxWaitersPerKey = 64
+        let (gateway, _) = makeGateway(config)
         let tok = try await token(gateway, caller: .siriAgent, caps: [reorder])
         let probe = Probe()
         let key = IdempotencyKey.mint()
@@ -136,6 +138,138 @@ final class GatewayTests: XCTestCase {
         XCTAssertEqual(runs, 0)
     }
 
+    func testAnotherPrincipalPresentingTheSameKeyGetsNoReplay() async throws {
+        let (gateway, _) = makeGateway()
+        let alice = try await gateway.issue(skillID: "reorder", caller: .siriAgent, capabilities: [reorder], validForMillis: 60_000, principal: "alice").get()
+        let mallory = try await gateway.issue(skillID: "reorder", caller: .siriAgent, capabilities: [reorder], validForMillis: 60_000, principal: "mallory").get()
+        let key = IdempotencyKey.mint()
+        _ = await gateway.handle(GatewayRequest(token: alice, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: key, fingerprint: "usual")) { 111 }
+        let stolen = await gateway.handle(GatewayRequest(token: mallory, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: key, fingerprint: "usual")) { 222 }
+        guard case .success(222, replayed: false) = stolen else { return XCTFail("must not see alice's result, got \(stolen)") }
+    }
+
+    func testTokensWithoutAPrincipalAreIsolatedFromEachOther() async throws {
+        let (gateway, _) = makeGateway()
+        let a = try await token(gateway, caller: .siriAgent, caps: [reorder])
+        let b = try await token(gateway, caller: .siriAgent, caps: [reorder])
+        let key = IdempotencyKey.mint()
+        _ = await gateway.handle(GatewayRequest(token: a, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: key, fingerprint: "p")) { 1 }
+        let other = await gateway.handle(GatewayRequest(token: b, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: key, fingerprint: "p")) { 2 }
+        guard case .success(2, replayed: false) = other else { return XCTFail("got \(other)") }
+    }
+
+    func testSamePrincipalReplaysAcrossARefreshedToken() async throws {
+        let (gateway, _) = makeGateway()
+        let old = try await gateway.issue(skillID: "reorder", caller: .siriAgent, capabilities: [reorder], validForMillis: 60_000, principal: "alice").get()
+        let key = IdempotencyKey.mint()
+        _ = await gateway.handle(GatewayRequest(token: old, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: key, fingerprint: "usual")) { 111 }
+        await gateway.revoke(old)
+        let fresh = try await gateway.issue(skillID: "reorder", caller: .siriAgent, capabilities: [reorder], validForMillis: 60_000, principal: "alice").get()
+        let retry = await gateway.handle(GatewayRequest(token: fresh, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: key, fingerprint: "usual")) { 222 }
+        guard case .success(111, replayed: true) = retry else { return XCTFail("got \(retry)") }
+    }
+
+    func testSameKeyOnADifferentCapabilityIsADifferentRecord() async throws {
+        let (gateway, _) = makeGateway()
+        let cancel = Capability("orders.cancel", .write)
+        let tok = try await token(gateway, caller: .siriAgent, caps: [reorder, cancel])
+        let key = IdempotencyKey.mint()
+        _ = await gateway.handle(GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: key, fingerprint: "x")) { 1 }
+        let other = await gateway.handle(GatewayRequest(token: tok, capability: cancel, claimedCaller: .siriAgent, idempotencyKey: key, fingerprint: "x")) { 2 }
+        guard case .success(2, replayed: false) = other else { return XCTFail("got \(other)") }
+    }
+
+    func testWaitersPerKeyAreCappedAndTheOverflowGetsInProgress() async throws {
+        var config = Gateway<Int>.Configuration()
+        config.maxWaitersPerKey = 2
+        let (gateway, _) = makeGateway(config)
+        let tok = try await token(gateway, caller: .siriAgent, caps: [reorder])
+        let probe = Probe()
+        let request = GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: .mint(), fingerprint: "p")
+        let outcomes = await withTaskGroup(of: GatewayOutcome<Int>.self) { group in
+            for _ in 0..<10 {
+                group.addTask {
+                    await gateway.handle(request) {
+                        await probe.enter()
+                        try await Task.sleep(nanoseconds: 400_000_000)
+                        await probe.leave()
+                        return 5
+                    }
+                }
+            }
+            var all: [GatewayOutcome<Int>] = []
+            for await o in group { all.append(o) }
+            return all
+        }
+        let runs = await probe.runs
+        XCTAssertEqual(runs, 1)
+        let inProgress = outcomes.filter { if case .inProgress = $0 { return true }; return false }.count
+        let succeeded = outcomes.filter { if case .success(5, _) = $0 { return true }; return false }.count
+        XCTAssertEqual(succeeded, 3, "the leader plus two capped waiters")
+        XCTAssertEqual(inProgress, 7)
+        let waiting = await gateway.waiterCount
+        XCTAssertEqual(waiting, 0)
+    }
+
+    func testAWaiterGivesUpAfterMaxWaitWithoutAffectingTheLeader() async throws {
+        var config = Gateway<Int>.Configuration()
+        config.maxWaitMillis = 50
+        let (gateway, _) = makeGateway(config)
+        let tok = try await token(gateway, caller: .siriAgent, caps: [reorder])
+        let request = GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: .mint(), fingerprint: "p")
+        async let leader = gateway.handle(request) {
+            try await Task.sleep(nanoseconds: 600_000_000)
+            return 8
+        }
+        var polls = 0
+        while await gateway.executingCount == 0, polls < 500 {
+            polls += 1
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let waiter = await gateway.handle(request) { 9 }
+        guard case .inProgress = waiter else { return XCTFail("expected inProgress, got \(waiter)") }
+        let leaderResult = await leader
+        guard case .success(8, replayed: false) = leaderResult else { return XCTFail("leader got \(leaderResult)") }
+        let after = await gateway.handle(request) { 9 }
+        guard case .success(8, replayed: true) = after else { return XCTFail("retry should replay, got \(after)") }
+    }
+
+    func testACancelledWaiterStopsWaitingAndIsRemoved() async throws {
+        let (gateway, _) = makeGateway()
+        let tok = try await token(gateway, caller: .siriAgent, caps: [reorder])
+        let request = GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: .mint(), fingerprint: "p")
+        async let leader = gateway.handle(request) {
+            try await Task.sleep(nanoseconds: 800_000_000)
+            return 8
+        }
+        var polls = 0
+        while await gateway.executingCount == 0, polls < 500 {
+            polls += 1
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let waiterTask = Task { await gateway.handle(request) { 9 } }
+        polls = 0
+        while await gateway.waiterCount == 0, polls < 500 {
+            polls += 1
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        waiterTask.cancel()
+        let waiter = await waiterTask.value
+        guard case .inProgress = waiter else { return XCTFail("expected inProgress, got \(waiter)") }
+        let waiting = await gateway.waiterCount
+        XCTAssertEqual(waiting, 0)
+        _ = await leader
+    }
+
+    func testValidatingInitRejectsAnInvertedShedOrder() {
+        var config = Gateway<Int>.Configuration()
+        config.policy.shedDepth[.interactive] = 1
+        XCTAssertThrowsError(try Gateway<Int>(validating: config, clock: ManualClock())) { error in
+            XCTAssertFalse((error as? GatewayConfigurationError)?.issues.isEmpty ?? true)
+        }
+        XCTAssertNoThrow(try Gateway<Int>(validating: Gateway<Int>.Configuration(), clock: ManualClock()))
+    }
+
     func testRelativeIssueExpiresOnTheGatewaysOwnClock() async throws {
         let clock = ManualClock(startingAt: 1_000_000)
         let gateway = Gateway<Int>(clock: clock)
@@ -204,6 +338,10 @@ final class GatewayTests: XCTestCase {
         XCTAssertEqual(totalRuns, 2)
         let executing = await gateway.executingCount
         XCTAssertEqual(executing, 0)
+        let counters = await gateway.countersByClass()[TrafficClass(.siriAgent, .write)]
+        XCTAssertEqual(counters?.executed, 2)
+        XCTAssertEqual(counters?.failed, 10, "the leader and its 9 joiners all failed")
+        XCTAssertEqual(counters?.replayed, 0, "a joined failure is not a replay")
     }
 
     func testFullLedgerShedsInsteadOfRunningUnprotected() async throws {
@@ -235,11 +373,11 @@ final class GatewayTests: XCTestCase {
 }
 
 final class FallbackPresenterTests: XCTestCase {
-    func testShedWriteSaysNothingChangedAndRoundsTheWaitUp() {
+    func testShedWriteSaysThisRequestDidNotGoThroughAndRoundsTheWaitUp() {
         let f = FallbackPresenter.fallback(for: GatewayOutcome<Int>.shed(.overloaded, retryAfterMillis: 4_001), kind: .write, action: "place your order")
         XCTAssertEqual(f?.retryAfterSeconds, 5)
         XCTAssertEqual(f?.mayHaveExecuted, false)
-        XCTAssertTrue(f?.spoken.contains("Nothing was changed") ?? false)
+        XCTAssertTrue(f?.spoken.contains("this request didn't go through") ?? false)
         XCTAssertTrue(f?.spoken.contains("about 5 seconds") ?? false)
     }
 
@@ -254,13 +392,27 @@ final class FallbackPresenterTests: XCTestCase {
     func testHandlerFailureNeverClaimsNothingHappened() {
         let f = FallbackPresenter.fallback(for: GatewayOutcome<Int>.failed(HandlerFailure(message: "x")), kind: .write, action: "place your order")
         XCTAssertNil(f?.mayHaveExecuted)
-        XCTAssertFalse(f?.spoken.contains("Nothing was changed") ?? true)
+        XCTAssertFalse(f?.spoken.contains("didn't go through") ?? true)
     }
 
     func testDenialDoesNotAssumeTheCallerIsAShortcut() {
-        let f = FallbackPresenter.fallback(for: GatewayOutcome<Int>.denied(.expired), kind: .write, action: "place your order")
+        let f = FallbackPresenter.fallback(for: GatewayOutcome<Int>.denied(.capabilityNotGranted(Capability("orders", .write))), kind: .write, action: "place your order")
         XCTAssertEqual(f?.spoken, "I'm not allowed to place your order from here. Open the app to do it there.")
         XCTAssertEqual(f?.mayHaveExecuted, false)
+    }
+
+    func testExpiredOrRevokedGrantAsksForARefreshNotAPermissionChange() {
+        for outcome in [GatewayOutcome<Int>.denied(.expired), .denied(.unknownToken)] {
+            let f = FallbackPresenter.fallback(for: outcome, kind: .write, action: "place your order")
+            XCTAssertEqual(f?.spoken, "My permission to place your order has expired. Open the app to refresh it.")
+        }
+    }
+
+    func testInProgressPromisesNoDoubleRunAndDoesNotClaimNothingHappened() {
+        let f = FallbackPresenter.fallback(for: GatewayOutcome<Int>.inProgress(retryAfterMillis: 250), kind: .write, action: "place your order")
+        XCTAssertEqual(f?.mayHaveExecuted, true)
+        XCTAssertEqual(f?.retryAfterSeconds, 1)
+        XCTAssertFalse(f?.spoken.contains("didn't go through") ?? true)
     }
 
     func testSuccessHasNoFallback() {

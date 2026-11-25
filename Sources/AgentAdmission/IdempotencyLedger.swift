@@ -24,20 +24,24 @@ public struct IdempotencyKey: Hashable, Sendable, Codable, CustomStringConvertib
     public var description: String { rawValue }
 }
 
-/// The pure bookkeeping behind exactly-once writes, shared by the simulator and the live
-/// ``Gateway``.
+/// The pure bookkeeping behind at-most-once writes, shared by the simulator (keyed by intent)
+/// and the live ``Gateway`` (keyed by principal, skill, capability and idempotency key).
 ///
 /// * A key is **in flight** from ``begin(_:fingerprint:now:)`` until ``complete(_:value:now:)``
-///   or ``abandon(_:)``. In-flight entries are never evicted, because evicting one would let a
-///   retry execute the same write a second time while the first is still running.
+///   or ``abandon(_:)``.
 /// * A **completed** key replays its stored value until `ttlMillis` after completion. After
 ///   that it is forgotten, so a retry arriving later than the TTL executes again: the TTL must
 ///   be longer than the client's whole retry horizon (see ``RetryPolicy/horizonMillis``).
+/// * **Nothing unexpired is ever evicted**, in flight or completed. Evicting a completed entry
+///   early would turn a retry of a lost response into a second execution. When the ledger is
+///   full of live entries, ``begin(_:fingerprint:now:)`` returns ``BeginResult/full`` and the
+///   caller sheds the request instead of running it unprotected (fail closed). Size `capacity`
+///   for peak writes × TTL.
 /// * A key reused with a **different fingerprint** (a different payload) is a conflict, not a
 ///   replay: replaying the old result for a new request would be silently wrong.
 /// * Failures are **not** cached: ``abandon(_:)`` drops the entry, so the client's next retry
 ///   executes again. This is correct only if the handler fails atomically (see README limits).
-public struct IdempotencyLedger<Value: Sendable>: Sendable {
+public struct IdempotencyLedger<Key: Hashable & Sendable, Value: Sendable>: Sendable {
     public enum Lookup: Sendable {
         case absent
         case replay(Value)
@@ -47,7 +51,7 @@ public struct IdempotencyLedger<Value: Sendable>: Sendable {
 
     public enum BeginResult: Sendable, Equatable {
         case started
-        /// Every slot holds an in-flight key; nothing can be evicted safely.
+        /// Every slot holds an unexpired entry; nothing can be evicted without risking a double run.
         case full
         /// The key is already present; call ``lookup(_:fingerprint:now:)`` first.
         case alreadyPresent
@@ -65,7 +69,7 @@ public struct IdempotencyLedger<Value: Sendable>: Sendable {
 
     public let capacity: Int
     public let ttlMillis: Int64
-    private var entries: [IdempotencyKey: Entry] = [:]
+    private var entries: [Key: Entry] = [:]
 
     public init(capacity: Int, ttlMillis: Int64) {
         self.capacity = max(1, capacity)
@@ -81,7 +85,7 @@ public struct IdempotencyLedger<Value: Sendable>: Sendable {
         }
     }
 
-    public func lookup(_ key: IdempotencyKey, fingerprint: String, now: Int64) -> Lookup {
+    public func lookup(_ key: Key, fingerprint: String, now: Int64) -> Lookup {
         guard let entry = entries[key] else { return .absent }
         switch entry.state {
         case .inFlight:
@@ -92,7 +96,7 @@ public struct IdempotencyLedger<Value: Sendable>: Sendable {
         }
     }
 
-    public mutating func begin(_ key: IdempotencyKey, fingerprint: String, now: Int64) -> BeginResult {
+    public mutating func begin(_ key: Key, fingerprint: String, now: Int64) -> BeginResult {
         if let existing = entries[key] {
             if case let .completed(_, expiresAt) = existing.state, now >= expiresAt {
                 entries[key] = nil
@@ -101,25 +105,23 @@ public struct IdempotencyLedger<Value: Sendable>: Sendable {
             }
         }
         if entries.count >= capacity {
+            // O(n) over a bounded n; a production store would keep an expiry-ordered index.
             purgeExpired(now: now)
         }
-        if entries.count >= capacity {
-            guard let victim = earliestExpiringCompleted() else { return .full }
-            entries[victim] = nil
-        }
+        guard entries.count < capacity else { return .full }
         entries[key] = Entry(fingerprint: fingerprint, state: .inFlight)
         return .started
     }
 
     /// Marks an in-flight key completed. Ignored for keys that are not in flight.
-    public mutating func complete(_ key: IdempotencyKey, value: Value, now: Int64) {
+    public mutating func complete(_ key: Key, value: Value, now: Int64) {
         guard var entry = entries[key], case .inFlight = entry.state else { return }
         entry.state = .completed(value, expiresAt: Saturating.add(now, ttlMillis))
         entries[key] = entry
     }
 
     /// Drops an in-flight key so a retry may execute. Ignored for completed keys.
-    public mutating func abandon(_ key: IdempotencyKey) {
+    public mutating func abandon(_ key: Key) {
         guard let entry = entries[key], case .inFlight = entry.state else { return }
         entries[key] = nil
     }
@@ -129,17 +131,5 @@ public struct IdempotencyLedger<Value: Sendable>: Sendable {
             if case let .completed(_, expiresAt) = entry.state { return now < expiresAt }
             return true
         }
-    }
-
-    /// O(n) scan. `capacity` bounds n; a production store would keep an expiry-ordered index.
-    private func earliestExpiringCompleted() -> IdempotencyKey? {
-        var best: (key: IdempotencyKey, expiresAt: Int64)?
-        for (key, entry) in entries {
-            guard case let .completed(_, expiresAt) = entry.state else { continue }
-            if best == nil || expiresAt < (best?.expiresAt ?? .max) {
-                best = (key, expiresAt)
-            }
-        }
-        return best?.key
     }
 }

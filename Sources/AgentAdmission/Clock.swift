@@ -115,9 +115,9 @@ public struct RetryPolicy: Sendable, Equatable {
         return Saturating.add(delay, max(0, extra))
     }
 
-    /// Worst-case time from the first attempt to the last one starting, assuming each attempt
-    /// waits `perAttemptTimeoutMillis` and every hint is at most `maxRetryAfterMillis`. An
-    /// idempotency TTL shorter than this can let a late retry execute twice.
+    /// Worst-case time from the first attempt starting to the last attempt's timeout, assuming
+    /// each attempt waits `perAttemptTimeoutMillis` and every hint is at most
+    /// `maxRetryAfterMillis`. An idempotency TTL shorter than this can let a late retry execute twice.
     public func horizonMillis(perAttemptTimeoutMillis: Int64, maxRetryAfterMillis: Int64) -> Int64 {
         var total: Int64 = 0
         for attempt in stride(from: 1, to: maxAttempts, by: 1) {
