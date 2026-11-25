@@ -43,15 +43,16 @@ public enum FallbackPresenter {
         case let .inProgress(retryAfterMillis):
             let seconds = wholeSeconds(retryAfterMillis)
             return UserFacingFallback(
-                spoken: "I'm still working on that. Ask me again in a few seconds and I'll tell you how it went. It won't be done twice.",
-                visual: "Still in progress — check again shortly. It won't run twice.",
+                spoken: "I'm still working on that, and I won't start it again while it's running. Ask me again in a few seconds and I'll tell you how it went.",
+                visual: "Still in progress — check again shortly.",
                 retryAfterSeconds: seconds,
                 mayHaveExecuted: true
             )
         case .denied(.expired), .denied(.unknownToken):
+            // Expired and revoked look the same to the caller; don't claim which one it was.
             return UserFacingFallback(
-                spoken: "My permission to \(action) has expired. Open the app to refresh it.",
-                visual: "Permission expired — open the app to refresh it.",
+                spoken: "My permission to \(action) is no longer valid. Open the app to refresh it.",
+                visual: "Permission no longer valid — open the app to refresh it.",
                 retryAfterSeconds: nil,
                 mayHaveExecuted: false
             )
@@ -75,6 +76,13 @@ public enum FallbackPresenter {
                 visual: "Conflicting request — this one was not run.",
                 retryAfterSeconds: nil,
                 mayHaveExecuted: false
+            )
+        case .failed where kind == .read:
+            return UserFacingFallback(
+                spoken: "I couldn't \(action) right now. Try again, or open the app.",
+                visual: "Couldn't load. Try again.",
+                retryAfterSeconds: nil,
+                mayHaveExecuted: nil
             )
         case .failed:
             return UserFacingFallback(

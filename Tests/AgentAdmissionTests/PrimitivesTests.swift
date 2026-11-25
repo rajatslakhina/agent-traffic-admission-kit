@@ -197,11 +197,36 @@ final class IntentKeyCacheTests: XCTestCase {
         XCTAssertNotEqual(cache.key(for: "reorder:usual", now: 1_020), afterSuccess, "the window ends")
     }
 
-    func testCapacityIsBoundedAndClockGoingBackwardsReMints() {
+    func testCapacityIsBounded() {
         var cache = IntentKeyCache(windowMillis: 10_000, capacity: 3)
         for i in 0..<10 { _ = cache.key(for: "s\(i)", now: Int64(i)) }
         XCTAssertEqual(cache.count, 3)
-        let k = cache.key(for: "x", now: 100)
-        XCTAssertNotEqual(cache.key(for: "x", now: 50), k)
+    }
+
+    /// A persisted cache read by a process-relative clock sees "future" mint times. Reusing the
+    /// key is the safe direction: minting a new one would let a retry double-charge.
+    func testClockGoingBackwardsReusesTheKeyInsteadOfMintingANewOne() {
+        var cache = IntentKeyCache(windowMillis: 10_000, capacity: 3)
+        let k = cache.key(for: "x", now: 1_000_000)
+        XCTAssertEqual(cache.key(for: "x", now: 5), k)
+    }
+
+    func testIntentKeysActorSharesOneKeyAcrossConcurrentCallers() async {
+        let keys = IntentKeys(clock: ManualClock(startingAt: 0))
+        let all = await withTaskGroup(of: IdempotencyKey.self) { group in
+            for _ in 0..<20 { group.addTask { await keys.key(for: "reorder:usual") } }
+            var out = Set<IdempotencyKey>()
+            for await k in group { out.insert(k) }
+            return out
+        }
+        XCTAssertEqual(all.count, 1)
+        await keys.clear("reorder:usual")
+        let fresh = await keys.key(for: "reorder:usual")
+        XCTAssertFalse(all.contains(fresh))
+    }
+
+    func testWallClockIsEpochMilliseconds() {
+        // 2020-01-01 in epoch ms; any machine running this test is past it.
+        XCTAssertGreaterThan(WallClock().nowMillis(), 1_577_836_800_000)
     }
 }

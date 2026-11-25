@@ -71,7 +71,12 @@ public struct GatewayConfigurationError: Error, Sendable, Equatable {
 /// Where a write's idempotency record lives. Scoping by principal, skill and capability means
 /// one caller can never read another caller's stored result by presenting their key.
 struct LedgerKey: Hashable, Sendable {
-    let principal: String
+    /// Separate cases, so a principal id can never collide with a token-derived scope.
+    enum Scope: Hashable, Sendable {
+        case principal(String)
+        case token(ScopeToken)
+    }
+    let scope: Scope
     let skillID: String
     let capability: Capability
     let key: IdempotencyKey
@@ -96,8 +101,10 @@ public actor Gateway<Value: Sendable> {
         /// reports to the policy is the number of handlers currently executing.
         public var workers: Int
         public var meanServiceMillis: Int64
-        /// Size for peak writes × TTL: a full ledger sheds new writes rather than evict live records.
+        /// Size for peak sustained writes × TTL: a full ledger sheds new writes rather than evict
+        /// live records. The defaults (100,000 × 10 min) cover about 166 writes/s sustained.
         public var ledgerCapacity: Int
+        /// Must exceed the clients' retry horizon (``RetryPolicy/horizonMillis(perAttemptTimeoutMillis:maxRetryAfterMillis:)``).
         public var ledgerTTLMillis: Int64
         /// Most duplicates allowed to wait on one in-flight key; more get `.inProgress`.
         public var maxWaitersPerKey: Int
@@ -108,8 +115,8 @@ public actor Gateway<Value: Sendable> {
             policy: ClassAwarePolicy.Configuration = .standard,
             workers: Int = 8,
             meanServiceMillis: Int64 = 50,
-            ledgerCapacity: Int = 10_000,
-            ledgerTTLMillis: Int64 = 24 * 60 * 60 * 1_000,
+            ledgerCapacity: Int = 100_000,
+            ledgerTTLMillis: Int64 = 10 * 60 * 1_000,
             maxWaitersPerKey: Int = 32,
             maxWaitMillis: Int64 = 10_000
         ) {
@@ -223,7 +230,10 @@ public actor Gateway<Value: Sendable> {
         }
 
         let ledgerKey = request.idempotencyKey.map {
-            LedgerKey(principal: grant.principal ?? "token:" + request.token.rawValue, skillID: grant.skillID, capability: request.capability, key: $0)
+            LedgerKey(
+                scope: grant.principal.map(LedgerKey.Scope.principal) ?? .token(request.token),
+                skillID: grant.skillID, capability: request.capability, key: $0
+            )
         }
 
         // 3. Duplicates are served without admission: they cost a lookup, not a handler run.
@@ -242,14 +252,8 @@ public actor Gateway<Value: Sendable> {
             }
         }
 
-        // 4. Admission. Shedding here is strictly before execution.
-        let load = LoadSignal(queueDepth: executing, workers: configuration.workers, meanServiceMillis: configuration.meanServiceMillis)
-        if case let .shed(reason, retryAfter) = policy.decide(traffic, load: load, now: now) {
-            bump(traffic) { $0.shed += 1 }
-            return .shed(reason, retryAfterMillis: retryAfter)
-        }
-
-        // 5. Claim the key. No `await` since step 3, so nobody else can have claimed it.
+        // 4. Claim the key first, so a full ledger sheds before the policy spends a token.
+        //    No `await` since step 3, so nobody else can have claimed it.
         if let ledgerKey {
             switch ledger.begin(ledgerKey, fingerprint: request.fingerprint, now: now) {
             case .started:
@@ -259,6 +263,14 @@ public actor Gateway<Value: Sendable> {
                 bump(traffic) { $0.shed += 1 }
                 return .shed(.overloaded, retryAfterMillis: retryHint)
             }
+        }
+
+        // 5. Admission. Shedding here is strictly before execution; release the claim if shed.
+        let load = LoadSignal(queueDepth: executing, workers: configuration.workers, meanServiceMillis: configuration.meanServiceMillis)
+        if case let .shed(reason, retryAfter) = policy.decide(traffic, load: load, now: now) {
+            if let ledgerKey { ledger.abandon(ledgerKey) }
+            bump(traffic) { $0.shed += 1 }
+            return .shed(reason, retryAfterMillis: retryAfter)
         }
 
         bump(traffic) { $0.admitted += 1; $0.executed += 1 }

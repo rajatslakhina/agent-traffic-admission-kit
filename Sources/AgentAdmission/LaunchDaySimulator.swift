@@ -216,6 +216,8 @@ public struct SimulationReport: Sendable, Equatable {
     public let utilization: Double
     /// `true` if `TrafficProfile.maxArrivals` capped the generated traffic.
     public let truncated: Bool
+    /// `true` if the calling task was cancelled mid-run; the numbers are then partial.
+    public let cancelled: Bool
 
     public func report(for traffic: TrafficClass) -> ClassReport {
         perClass.first { $0.traffic == traffic } ?? ClassReport(traffic: traffic)
@@ -281,7 +283,8 @@ public enum Percentile {
 ///
 /// It runs the same ``ClassAwarePolicy`` the live ``Gateway`` runs, so the numbers the demo
 /// shows come from the shipped decision code, not a re-implementation. Same profile + setup +
-/// seed gives the same report, bit for bit.
+/// seed gives the same report, bit for bit. It checks `Task.isCancelled` every 4,096 events
+/// and returns a partial report marked ``SimulationReport/cancelled`` if the caller gave up.
 public enum LaunchDaySimulator {
     public static func run(profile: TrafficProfile, setup: SimulationSetup) -> SimulationReport {
         var engine = Engine(profile: profile.normalized(), setup: setup)
@@ -410,7 +413,12 @@ private struct Engine {
 
     mutating func run() -> SimulationReport {
         generateArrivals()
+        var processed = 0
+        var cancelled = false
         while let event = events.pop() {
+            processed &+= 1
+            // Cooperative cancellation, checked cheaply: a superseded run in an app stops early.
+            if processed % 4_096 == 0, Task.isCancelled { cancelled = true; break }
             let now = event.time
             switch event.kind {
             case let .arrival(i, a): arrive(i, attempt: a, now: now)
@@ -429,7 +437,8 @@ private struct Engine {
             perClass: perClass,
             timeline: timeline.keys.sorted().compactMap { timeline[$0] },
             utilization: capacity > 0 ? Double(busyMillis) / capacity : 0,
-            truncated: truncated
+            truncated: truncated,
+            cancelled: cancelled
         )
     }
 

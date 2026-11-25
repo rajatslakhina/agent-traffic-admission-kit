@@ -15,7 +15,7 @@ Demo app: (added after the companion repo is pushed — see below)
 | Writes executed more than once (double charges) | 486 | **0** |
 | Siri AI intents that succeeded | 40.9% | **69.9%** |
 
-*These numbers come from `LaunchDaySimulator.run(profile: .launchDay, …)`. A golden test pins every number on this page, and the full tables are [below](#the-numbers).*
+*These numbers come from `LaunchDaySimulator.run(profile: .launchDay, …)`. A golden test pins every simulation result on this page, and the full tables are [below](#the-numbers).*
 
 ## Why this matters
 
@@ -38,7 +38,7 @@ No single request is buggy. The problem lies in how the system is designed, so t
 
 `Gateway` is a **single-process reference implementation** of the server side. You can run it in a server-side Swift process (Vapor, Hummingbird) or port it to your backend's language. CI builds and tests it on Linux as well as macOS. The demo app runs it in-process so you can watch it work on a phone.
 
-The pure parts do no I/O, so a fleet port changes storage, not logic: `ClassAwarePolicy`, `IdempotencyLedger`, `ScopeAuthority`, `TokenBucket`. The client-side pieces belong in the iOS app: `IdempotencyKey`, `IntentKeyCache`, `RetryPolicy`, `FallbackPresenter`.
+The pure parts do no I/O, so a fleet port changes storage, not logic: `ClassAwarePolicy`, `IdempotencyLedger`, `ScopeAuthority`, `TokenBucket`. The client-side pieces belong in the iOS app: `IdempotencyKey`, `IntentKeyCache` (and its actor wrapper `IntentKeys`, on `WallClock`), `RetryPolicy`, `FallbackPresenter`.
 
 ## Design
 
@@ -49,8 +49,9 @@ The pure parts do no I/O, so a fleet port changes storage, not logic: `ClassAwar
  AppIntent.perform ─┼─ token + capability + key ─▶ 1 ScopeAuthority  who is this, really?
  Widget timeline  ─┘   (key outlives perform(),     2 write without key? reject
                         see IntentKeyCache)         3 IdempotencyLedger  replay / join / conflict
-                                                     4 ClassAwarePolicy   shed in tier order, buckets
-                                                     5 claim key → run handler
+                                                     4 claim key (full ledger → shed)
+                                                     5 ClassAwarePolicy   shed in tier order, buckets
+                                                       → run handler
                                                      6 complete / abandon → wake joiners
  FallbackPresenter ◀── GatewayOutcome ───────────────┘
  ("this request didn't go through. Try again in about 3 seconds.")
@@ -100,15 +101,16 @@ A grant can be revoked at any time. If a request claims `.interactiveUI` with a 
 
 **5. No `await` between "is this key known?" and "this key is mine".** `Gateway` is an actor, and actor reentrancy happens only at suspension points.
 
-- Authorization, ledger lookup, admission and claiming the key all run synchronously.
+- Authorization, ledger lookup, claiming the key and admission all run synchronously. The key is claimed before the policy runs, so a full ledger sheds without spending a bucket token, and a policy shed releases the claim.
 - There are exactly two suspensions: the handler call, and a duplicate's wait for it. Neither sits between lookup and claim, and state is re-read after each.
 - `testFiftyConcurrentRetriesOfOneWriteExecuteTheHandlerOnce` sends fifty concurrent copies of the same write, and the handler runs exactly once. A control test proves the same harness really does overlap handlers when there's no key.
 
 **6. Shed strictly before execution, so the spoken fallback tells the truth about this attempt.** `FallbackPresenter` builds every sentence from what the outcome guarantees *for this attempt*. It never claims an earlier attempt did nothing, because it can't know that.
 
 - A shed write says "this request didn't go through. Try again in about 5 seconds."
-- `.inProgress` says the work is still running and won't be done twice.
-- An expired grant asks the person to refresh permission.
+- `.inProgress` says the work is still running and won't be started again while it runs.
+- An expired or revoked grant says the permission is no longer valid and asks the person to refresh it.
+- A failed read says to try again; only a failed write says to check first.
 - A handler failure guarantees nothing, so it says "It may not have finished, so open the app to check before trying again". Tests assert that this message never claims the request didn't go through.
 
 **7. The simulator runs the shipped decision code.** `LaunchDaySimulator` is a deterministic discrete-event simulation: seeded SplitMix64, Poisson arrivals, integer milliseconds. It calls the same `ClassAwarePolicy.decide` and the same `IdempotencyLedger` (keyed by intent) that the live `Gateway` uses. The numbers on this page come from the code you'd deploy, not from a model of it.
@@ -120,7 +122,7 @@ A grant can be revoked at any time. If a request claims `.interactiveUI` with a 
 | Agent burst past capacity | Agent reads are shed first, with a drain-time `Retry-After`. Interactive UI is never shed in the launch-day run |
 | Response lost after the server committed | A retry with the same key replays the stored result; the handler doesn't run again |
 | 50 concurrent retries of one write | One handler run. The others join it, up to `maxWaitersPerKey`; the rest get `.inProgress` |
-| In-flight execution hangs | Each joiner gives up after `maxWaitMillis` with `.inProgress`. Cancelled joiners are removed |
+| In-flight execution hangs | Each joiner gives up after `maxWaitMillis` with `.inProgress`, and cancelled joiners are removed. The record itself has no lease (see limits) |
 | Another principal presents your key | They get a separate record and can't read your result |
 | Same key, different payload | `.rejected(.idempotencyConflict)`, and nothing runs |
 | Handler throws | Not cached. Joiners get the failure, and the next retry runs again |
@@ -178,7 +180,7 @@ Each property above is tested alongside a broken counterpart:
 - **At most one run under concurrency:** 50 concurrent same-key writes run once. The no-key control proves the harness really runs handlers concurrently (peak > 1).
 - **No cross-principal replay:** a second principal who presents the same key and payload gets a fresh execution, not the first principal's result.
 - **Fail closed:** a full ledger refuses new writes instead of evicting a live record. A tiny simulated ledger sheds more and still double-runs nothing.
-- **Golden numbers:** `testGoldenNumbersQuotedInTheREADME` pins every figure quoted on this page and in the release notes.
+- **Golden numbers:** `testGoldenNumbersQuotedInTheREADME` pins every simulation result quoted on this page and in the release notes. The profile's inputs (71 req/s, ~40% / ~110% load) are arithmetic on `TrafficProfile.launchDay`'s rates and service times.
 
 ## Usage
 
@@ -187,6 +189,8 @@ Server side:
 ```swift
 import AgentAdmission
 
+// Defaults: TTL 10 min (above the well-behaved agent's retry horizon), capacity 100,000 records,
+// i.e. about 166 writes/s sustained before the ledger fails closed. Size both for your traffic.
 let gateway = try Gateway<OrderReceipt>(validating: .init(), clock: MonotonicClock())
 
 // When a user enables your Siri AI skill, issue it a narrow, class-bound grant.
@@ -209,11 +213,14 @@ let outcome = await gateway.handle(GatewayRequest(
 App side. The key has to survive the assistant calling `perform()` again:
 
 ```swift
-// One cache for the process; use an app-group store if your intents run out of process.
+// One shared, actor-isolated cache for the process, on wall-clock time.
+enum Keys { static let intents = IntentKeys(clock: WallClock()) }
+
+// Inside AppIntent.perform():
 let signature = "reorder:\(order.digest)"
-let key = keyCache.key(for: signature, now: clock.nowMillis())   // same key on every retry
+let key = await Keys.intents.key(for: signature)              // same key on every retry
 let outcome = try await api.reorder(order, idempotencyKey: key)
-if case .success = outcome { keyCache.clear(signature) }        // the next reorder is a new intent
+if case .success = outcome { await Keys.intents.clear(signature) } // the next reorder is a new intent
 
 if let fallback = FallbackPresenter.fallback(for: outcome, kind: .write, action: "place your order") {
     return .result(dialog: IntentDialog(stringLiteral: fallback.spoken))
@@ -223,7 +230,7 @@ if let fallback = FallbackPresenter.fallback(for: outcome, kind: .write, action:
 Add it with SwiftPM:
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/agent-traffic-admission-kit.git", from: "2.0.0")
+.package(url: "https://github.com/rajatslakhina/agent-traffic-admission-kit.git", from: "2.1.0")
 ```
 
 ## Honest limits
@@ -237,15 +244,16 @@ Add it with SwiftPM:
 - **Caller class is bound when the grant is issued, not attested.** This stops honest-but-buggy clients and confused-deputy agent paths from borrowing UI priority. It does not stop a malicious client that holds a UI token from replaying it on the agent path. That needs App Attest or similar.
 - **Failures aren't cached.** That is correct only if the handler fails atomically. A handler that charges a card and then throws needs its own compensation. That's why the fallback text says "check before retrying".
 - **TTL must outlive the retry horizon, and capacity must cover peak writes × TTL.** A retry that arrives after its record expired runs again; `RetryPolicy.horizonMillis(...)` tells you the horizon to compare against. A full ledger sheds writes (fails closed) rather than evicting records.
-- **`IntentKeyCache` is in-memory.** Inside its window it treats identical requests as one until you call `clear` on success. If the system retries your intent in a fresh process, persist the cache.
+- **No lease on in-flight records.** A handler that never returns pins its key: retries get `.inProgress` indefinitely, the record holds a ledger slot, and it counts toward load. Bound handler time inside the handler; the ledger can't safely expire a claim whose work may still commit.
+- **`IntentKeyCache` is in-memory.** Inside its window it treats identical requests as one until you call `clear` on success. If the system retries your intent in a fresh process, persist the cache and keep `WallClock` (a backwards reading reuses the key, erring toward dedup).
 - **The live gateway has no wait queue.** It uses the count of executing handlers as its load signal, while the simulator models a real queue. The policy code is shared; only the load signal differs.
 - **Simulated, not load-tested.** The numbers come from the deterministic simulator, not a production fleet. They show the shape of the effect; they are not a capacity plan.
 - **`ManualClock` is `@unchecked Sendable`.** Its only state is guarded by an `NSLock` on every access.
 
 ## Verification
 
-- `swift build -Xswiftc -warnings-as-errors` and `swift test` (87 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2.
-- CI runs on every push to `main`, every tag and every pull request, with three jobs:
+- `swift build -Xswiftc -warnings-as-errors` and `swift test` (94 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2.
+- CI runs on every push to `main`, every `v*` tag and every pull request, with three jobs:
   - macOS build and test, with warnings treated as errors
   - Linux build and test, in a Swift 6.0 container
   - an iOS build with `xcodebuild … -destination 'generic/platform=iOS Simulator'`

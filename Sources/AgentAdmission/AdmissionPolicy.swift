@@ -62,7 +62,9 @@ public struct BucketSpec: Sendable, Equatable, Codable {
 /// writes, and interactive UI last. Each tier has a queue depth past which it may not add work,
 /// and agent-shaped and widget traffic additionally draws from a per-(caller, kind) token bucket.
 ///
-/// Overload is checked **before** the bucket, so a shed request never burns a token.
+/// Inside the policy, overload is checked **before** the bucket, so a request the policy sheds
+/// for overload never burns a token. (The ``Gateway`` also claims the idempotency key before
+/// asking the policy, so a full ledger sheds without spending one either.)
 public struct ClassAwarePolicy: AdmissionPolicy {
     public struct Configuration: Sendable, Equatable {
         /// A tier is shed when `queueDepth >= shedDepth[tier]`. A tier with no entry is never

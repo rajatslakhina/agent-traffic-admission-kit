@@ -270,6 +270,25 @@ final class GatewayTests: XCTestCase {
         XCTAssertNoThrow(try Gateway<Int>(validating: Gateway<Int>.Configuration(), clock: ManualClock()))
     }
 
+    func testAFullLedgerShedsWithoutSpendingABucketToken() async throws {
+        var config = Gateway<Int>.Configuration()
+        config.ledgerCapacity = 1
+        config.ledgerTTLMillis = 1_000
+        config.policy.buckets = [TrafficClass(.siriAgent, .write): BucketSpec(capacity: 2, refillPerSecond: 0)]
+        let (gateway, clock) = makeGateway(config)
+        let tok = try await token(gateway, caller: .siriAgent, caps: [reorder])
+        func write(_ fp: String) -> GatewayRequest {
+            GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: .mint(), fingerprint: fp)
+        }
+        guard case .success = await gateway.handle(write("a"), operation: { 1 }) else { return XCTFail("first write") }
+        // Ledger holds a's live record: b is shed by the ledger...
+        guard case .shed(.overloaded, _) = await gateway.handle(write("b"), operation: { 2 }) else { return XCTFail("b should be shed") }
+        clock.advance(byMillis: 1_000)
+        // ...and must not have spent the bucket's second (last) token.
+        let c = await gateway.handle(write("c"), operation: { 3 })
+        guard case .success(3, replayed: false) = c else { return XCTFail("c should run with the unspent token, got \(c)") }
+    }
+
     func testRelativeIssueExpiresOnTheGatewaysOwnClock() async throws {
         let clock = ManualClock(startingAt: 1_000_000)
         let gateway = Gateway<Int>(clock: clock)
@@ -404,7 +423,7 @@ final class FallbackPresenterTests: XCTestCase {
     func testExpiredOrRevokedGrantAsksForARefreshNotAPermissionChange() {
         for outcome in [GatewayOutcome<Int>.denied(.expired), .denied(.unknownToken)] {
             let f = FallbackPresenter.fallback(for: outcome, kind: .write, action: "place your order")
-            XCTAssertEqual(f?.spoken, "My permission to place your order has expired. Open the app to refresh it.")
+            XCTAssertEqual(f?.spoken, "My permission to place your order is no longer valid. Open the app to refresh it.")
         }
     }
 
@@ -413,6 +432,11 @@ final class FallbackPresenterTests: XCTestCase {
         XCTAssertEqual(f?.mayHaveExecuted, true)
         XCTAssertEqual(f?.retryAfterSeconds, 1)
         XCTAssertFalse(f?.spoken.contains("didn't go through") ?? true)
+    }
+
+    func testFailedReadGetsReadAdviceNotCheckBeforeRetrying() {
+        let f = FallbackPresenter.fallback(for: GatewayOutcome<Int>.failed(HandlerFailure(message: "x")), kind: .read, action: "check the menu")
+        XCTAssertEqual(f?.spoken, "I couldn't check the menu right now. Try again, or open the app.")
     }
 
     func testSuccessHasNoFallback() {

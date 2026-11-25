@@ -19,6 +19,16 @@ public struct MonotonicClock: AdmissionClock {
     }
 }
 
+/// Milliseconds since 1970 (wall time). Use it for anything persisted across processes, such as
+/// an ``IntentKeyCache`` saved to disk. It can jump when the user changes the time; consumers
+/// here treat a backwards jump conservatively.
+public struct WallClock: AdmissionClock {
+    public init() {}
+    public func nowMillis() -> Int64 {
+        Saturating.int64(Date().timeIntervalSince1970 * 1_000)
+    }
+}
+
 /// A clock tests and the demo advance by hand.
 ///
 /// `@unchecked Sendable` is sound here: the only stored state is guarded by `lock` on every access.

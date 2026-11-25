@@ -41,6 +41,9 @@ public struct IdempotencyKey: Hashable, Sendable, Codable, CustomStringConvertib
 ///   replay: replaying the old result for a new request would be silently wrong.
 /// * Failures are **not** cached: ``abandon(_:)`` drops the entry, so the client's next retry
 ///   executes again. This is correct only if the handler fails atomically (see README limits).
+/// * In-flight records have **no lease**. A handler that never returns pins its key (retries
+///   get "in progress") and holds a slot. Bound handler time inside the handler itself; the
+///   ledger can't safely expire a claim whose work may still commit.
 public struct IdempotencyLedger<Key: Hashable & Sendable, Value: Sendable>: Sendable {
     public enum Lookup: Sendable {
         case absent
@@ -70,6 +73,11 @@ public struct IdempotencyLedger<Key: Hashable & Sendable, Value: Sendable>: Send
     public let capacity: Int
     public let ttlMillis: Int64
     private var entries: [Key: Entry] = [:]
+    /// Earliest expiry among completed records, so a full ledger only rescans when something
+    /// can actually be reclaimed (no O(capacity) work per request while overloaded).
+    private var earliestExpiry: Int64?
+    /// Number of full scans performed. Exposed for tests.
+    public private(set) var purgeScans = 0
 
     public init(capacity: Int, ttlMillis: Int64) {
         self.capacity = max(1, capacity)
@@ -104,8 +112,8 @@ public struct IdempotencyLedger<Key: Hashable & Sendable, Value: Sendable>: Send
                 return .alreadyPresent
             }
         }
-        if entries.count >= capacity {
-            // O(n) over a bounded n; a production store would keep an expiry-ordered index.
+        if entries.count >= capacity, let earliest = earliestExpiry, now >= earliest {
+            // O(n) over a bounded n, and only when at least one record has expired.
             purgeExpired(now: now)
         }
         guard entries.count < capacity else { return .full }
@@ -116,8 +124,10 @@ public struct IdempotencyLedger<Key: Hashable & Sendable, Value: Sendable>: Send
     /// Marks an in-flight key completed. Ignored for keys that are not in flight.
     public mutating func complete(_ key: Key, value: Value, now: Int64) {
         guard var entry = entries[key], case .inFlight = entry.state else { return }
-        entry.state = .completed(value, expiresAt: Saturating.add(now, ttlMillis))
+        let expiresAt = Saturating.add(now, ttlMillis)
+        entry.state = .completed(value, expiresAt: expiresAt)
         entries[key] = entry
+        earliestExpiry = min(earliestExpiry ?? expiresAt, expiresAt)
     }
 
     /// Drops an in-flight key so a retry may execute. Ignored for completed keys.
@@ -127,9 +137,14 @@ public struct IdempotencyLedger<Key: Hashable & Sendable, Value: Sendable>: Send
     }
 
     public mutating func purgeExpired(now: Int64) {
+        purgeScans += 1
+        var earliest: Int64?
         entries = entries.filter { _, entry in
-            if case let .completed(_, expiresAt) = entry.state { return now < expiresAt }
+            guard case let .completed(_, expiresAt) = entry.state else { return true }
+            guard now < expiresAt else { return false }
+            earliest = min(earliest ?? expiresAt, expiresAt)
             return true
         }
+        earliestExpiry = earliest
     }
 }

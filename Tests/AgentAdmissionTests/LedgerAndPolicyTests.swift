@@ -51,6 +51,19 @@ final class IdempotencyLedgerTests: XCTestCase {
         guard case .absent = ledger.lookup(key("paid"), fingerprint: "f", now: 1_000) else { return XCTFail("expired") }
     }
 
+    /// While nothing has expired, a full ledger must refuse in O(1), not rescan on every call.
+    func testFullLedgerDoesNotRescanUntilSomethingCanExpire() {
+        var ledger = IdempotencyLedger<Int, Int>(capacity: 2, ttlMillis: 1_000)
+        for k in 0..<2 {
+            _ = ledger.begin(k, fingerprint: "", now: 0)
+            ledger.complete(k, value: k, now: 0)
+        }
+        for i in 0..<100 { XCTAssertEqual(ledger.begin(100 + i, fingerprint: "", now: 500), .full) }
+        XCTAssertEqual(ledger.purgeScans, 0)
+        XCTAssertEqual(ledger.begin(999, fingerprint: "", now: 1_000), .started)
+        XCTAssertEqual(ledger.purgeScans, 1)
+    }
+
     func testAbandonFreesAnInFlightKeyButNotACompletedOne() {
         var ledger = IdempotencyLedger<IdempotencyKey, Int>(capacity: 4, ttlMillis: 1_000)
         _ = ledger.begin(key("a"), fingerprint: "f", now: 0)

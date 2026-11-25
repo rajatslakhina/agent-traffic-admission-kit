@@ -136,6 +136,17 @@ final class LaunchDaySimulationTests: XCTestCase {
         XCTAssertNotEqual(LaunchDaySimulator.run(profile: other, setup: .classAware).perClass, Self.aware.perClass)
     }
 
+    func testACancelledCallerGetsAPartialReportMarkedCancelled() async {
+        let task = Task.detached { () -> SimulationReport in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return LaunchDaySimulator.run(profile: .launchDay, setup: .classAware)
+        }
+        let report = await task.value
+        XCTAssertTrue(report.cancelled)
+        XCTAssertFalse(Self.aware.cancelled)
+        XCTAssertLessThan(report.perClass.reduce(0) { $0 + $1.succeeded }, Self.aware.perClass.reduce(0) { $0 + $1.succeeded })
+    }
+
     func testNoBurstMeansNoSheddingForAnyone() {
         var calm = TrafficProfile.launchDay
         calm.burstMultiplier = 1
