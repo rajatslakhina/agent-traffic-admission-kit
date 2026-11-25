@@ -211,7 +211,7 @@ final class GatewayTests: XCTestCase {
         XCTAssertEqual(waiting, 0)
     }
 
-    func testAWaiterGivesUpAfterMaxWaitWithoutAffectingTheLeader() async throws {
+    func testWaitersGiveUpAfterMaxWaitWhileTheWriteFinishesAndARetryReplaysIt() async throws {
         var config = Gateway<Int>.Configuration()
         config.maxWaitMillis = 50
         let (gateway, _) = makeGateway(config)
@@ -228,8 +228,14 @@ final class GatewayTests: XCTestCase {
         }
         let waiter = await gateway.handle(request) { 9 }
         guard case .inProgress = waiter else { return XCTFail("expected inProgress, got \(waiter)") }
+        // The starting request's wait is bounded the same way; the write itself keeps running.
         let leaderResult = await leader
-        guard case .success(8, replayed: false) = leaderResult else { return XCTFail("leader got \(leaderResult)") }
+        guard case .inProgress = leaderResult else { return XCTFail("leader got \(leaderResult)") }
+        polls = 0
+        while await gateway.executingCount > 0, polls < 1_000 {
+            polls += 1
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
         let after = await gateway.handle(request) { 9 }
         guard case .success(8, replayed: true) = after else { return XCTFail("retry should replay, got \(after)") }
     }
@@ -358,6 +364,48 @@ final class GatewayTests: XCTestCase {
         let running = await probe.running
         XCTAssertEqual(runs, 1)
         XCTAssertEqual(running, 0, "the handler ran to completion instead of being cancelled")
+    }
+
+    func testTheStartingRequestsWaitIsBoundedButTheWriteStillCompletes() async throws {
+        var config = Gateway<Int>.Configuration()
+        config.maxWaitMillis = 50
+        let (gateway, _) = makeGateway(config)
+        let tok = try await token(gateway, caller: .siriAgent, caps: [reorder])
+        let request = GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: .mint(), fingerprint: "p")
+        let first = await gateway.handle(request) {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            return 7
+        }
+        guard case .inProgress = first else { return XCTFail("starting request should stop waiting, got \(first)") }
+        var polls = 0
+        while await gateway.executingCount > 0, polls < 1_000 {
+            polls += 1
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let retry = await gateway.handle(request) { 0 }
+        guard case .success(7, replayed: true) = retry else { return XCTFail("retry should replay the finished write, got \(retry)") }
+    }
+
+    func testAFailureNobodyWaitedForIsStillCountedPerExecution() async throws {
+        var config = Gateway<Int>.Configuration()
+        config.maxWaitMillis = 20
+        let (gateway, _) = makeGateway(config)
+        let tok = try await token(gateway, caller: .siriAgent, caps: [reorder])
+        let request = GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: .mint(), fingerprint: "p")
+        let outcome = await gateway.handle(request) {
+            try await Task.sleep(nanoseconds: 200_000_000)
+            throw Boom()
+        }
+        guard case .inProgress = outcome else { return XCTFail("got \(outcome)") }
+        var polls = 0
+        while await gateway.executingCount > 0, polls < 1_000 {
+            polls += 1
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let counters = await gateway.countersByClass()[TrafficClass(.siriAgent, .write)]
+        XCTAssertEqual(counters?.executionsFailed, 1)
+        XCTAssertEqual(counters?.failed, 0, "nobody was waiting to be told")
+        XCTAssertEqual(counters?.inProgress, 1)
     }
 
     func testRelativeIssueExpiresOnTheGatewaysOwnClock() async throws {

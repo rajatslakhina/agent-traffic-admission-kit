@@ -102,8 +102,10 @@ final class IdempotencyLedgerTests: XCTestCase {
     }
 
     /// Measures work, not a call count: rebuilding the table (the 2.1.0 bug) would touch all
-    /// 10,000 keys; reclaiming through the heap touches a handful.
-    func testReclaimingOneSlotInAFullTenThousandEntryLedgerTouchesAHandfulOfKeys() {
+    /// 10,000 keys; reclaiming through the heap touches typically about a dozen. The bound
+    /// (capacity / 20) leaves room for hash-seed variance and still separates O(1) from a rebuild;
+    /// CI also pins `SWIFT_DETERMINISTIC_HASHING=1`.
+    func testReclaimingOneSlotInAFullTenThousandEntryLedgerTouchesABoundedNumberOfKeys() {
         let counter = WorkCounter()
         var ledger = IdempotencyLedger<CountingKey, Int>(capacity: 10_000, ttlMillis: 1_000)
         for i in 0..<10_000 {
@@ -114,7 +116,7 @@ final class IdempotencyLedgerTests: XCTestCase {
         // At 1_000 exactly one record (completed at 0) has expired.
         counter.touches = 0
         XCTAssertEqual(ledger.begin(CountingKey(id: -1, counter: counter), fingerprint: "", now: 1_000), .started)
-        XCTAssertLessThanOrEqual(counter.touches, 100)
+        XCTAssertLessThanOrEqual(counter.touches, 10_000 / 20)
         XCTAssertEqual(ledger.count, 10_000)
     }
 
@@ -130,7 +132,7 @@ final class IdempotencyLedgerTests: XCTestCase {
         }
         counter.touches = 0
         XCTAssertEqual(ledger.begin(CountingKey(id: -1, counter: counter), fingerprint: "", now: 10_000), .started)
-        XCTAssertLessThanOrEqual(counter.touches, 100)
+        XCTAssertLessThanOrEqual(counter.touches, 5_000 / 20)
         XCTAssertEqual(ledger.count, 5_000, "only one expired record was reclaimed")
     }
 

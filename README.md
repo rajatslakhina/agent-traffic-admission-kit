@@ -5,7 +5,7 @@
 [![CI](https://github.com/rajatslakhina/agent-traffic-admission-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/rajatslakhina/agent-traffic-admission-kit/actions/workflows/ci.yml)
 ![Swift 6](https://img.shields.io/badge/Swift-6-orange) ![iOS 17+ · macOS 14+ · Linux](https://img.shields.io/badge/iOS%2017%2B%20%C2%B7%20macOS%2014%2B%20%C2%B7%20Linux-blue)
 
-Demo app: (added after the companion repo is pushed — see below)
+Demo app: (added after the companion repo is pushed)
 
 | Launch-day burst, same traffic, same 8 workers | Sized for taps (class-blind FIFO) | **AgentAdmission** (class-aware) |
 |---|---|---|
@@ -98,7 +98,7 @@ A grant can be revoked at any time. If a request claims `.interactiveUI` with a 
 - **Joining is bounded.** There are at most `maxWaitersPerKey` waiters, each waits at most `maxWaitMillis`, and cancelled waiters are removed. A waiter that stops waiting gets `.inProgress`, which tells the client to retry with the same key, never to start over.
 - **A different payload is a conflict.** The same key with a different payload fingerprint is a **conflict**. Replaying the old result for a new request would be silently wrong.
 - **Nothing unexpired is ever evicted, in flight or completed.** Evicting a completed record early would turn the retry of a lost response into a double charge. A full ledger sheds new writes instead of running them unprotected, with a `Retry-After` of the time until its earliest record expires (not a fixed 250 ms that would invite a retry storm), and counts them as `ledgerFull`.
-- **A full ledger stays cheap.** Expired records are reclaimed through an expiry heap, one slot per request, so a ledger that sits full under sustained load costs amortised O(log n) per request, never a table scan on the actor, and a whole burst expiring at once isn't paid for by one unlucky request. Tests bound this by counting the keys each operation touches. Payload fingerprints are stored as a fixed 128-bit `FingerprintDigest`, so a record costs the same whatever the caller sent, and `IdempotencyKey` validates on decode as well as on init.
+- **A full ledger stays cheap.** Expired records are reclaimed through an expiry heap, one slot per request, so a ledger that sits full under sustained load costs amortised O(log n) per request, never a table scan on the actor, and a whole burst expiring at once isn't paid for by one unlucky request. Tests bound this by counting the keys each operation touches (typically about a dozen per request). Payload fingerprints are reduced to a fixed 128-bit `FingerprintDigest` when the request is built, off the actor, so a record costs the same whatever the caller sent and a long fingerprint can't stall the gateway, and `IdempotencyKey` validates on decode as well as on init.
 
 **5. No `await` between "is this key known?" and "this key is mine".** `Gateway` is an actor, and actor reentrancy happens only at suspension points.
 
@@ -124,7 +124,7 @@ A grant can be revoked at any time. If a request claims `.interactiveUI` with a 
 | Agent burst past capacity | Agent reads are shed first, with a drain-time `Retry-After`. Interactive UI is never shed in the launch-day run |
 | Response lost after the server committed | A retry with the same key replays the stored result; the handler doesn't run again |
 | 50 concurrent retries of one write | One handler run. The others join it, up to `maxWaitersPerKey`; the rest get `.inProgress` |
-| In-flight execution hangs | Each joiner gives up after `maxWaitMillis` with `.inProgress`, and cancelled joiners are removed. The record itself has no lease (see limits) |
+| In-flight execution hangs | Every waiting request (the one that started it and each joiner) gives up after `maxWaitMillis` with `.inProgress`, and cancelled waiters are removed. The record itself has no lease (see limits) |
 | Another principal presents your key | They get a separate record and can't read your result |
 | Same key, different payload | `.rejected(.idempotencyConflict)`, and nothing runs |
 | Handler throws | Not cached. Joiners get the failure, and the next retry runs again |
@@ -169,7 +169,7 @@ How to read the tables:
 
 - **Latencies** are milliseconds from an intent's first attempt to its success.
 - **`ok`** is rounded down to 0.1%, so `100%` means every intent succeeded.
-- **`dupExec`** counts handler runs beyond the first for one intent. On the class-aware side, every one of them is a **read** retried after a lost response. Reads carry no key, and re-running a read is harmless. Duplicate **writes** are 486 vs 0.
+- **`dupExec`** counts handler runs beyond the first for one intent. On the class-aware side every one of them is a **read** (reads carry no key, and re-running a read is harmless), and per class they never exceed the responses lost in transit. Duplicate **writes** are 486 vs 0.
 
 Agent intents still fail under a 10× burst: 1,086 of 3,615 Siri AI intents (30.0%) and 398 of 1,074 Shortcuts intents (37.1%). That is the design working as intended. They fail fast, before running, with an honest retry hint, instead of taking people down with them.
 
@@ -233,7 +233,7 @@ if let fallback = FallbackPresenter.fallback(for: outcome, kind: .write, action:
 Add it with SwiftPM:
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/agent-traffic-admission-kit.git", from: "2.3.0")
+.package(url: "https://github.com/rajatslakhina/agent-traffic-admission-kit.git", from: "2.4.0")
 ```
 
 ## Honest limits
@@ -256,7 +256,7 @@ Add it with SwiftPM:
 
 ## Verification
 
-- `swift build -Xswiftc -warnings-as-errors` and `swift test` (108 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2.
+- `swift build -Xswiftc -warnings-as-errors` and `swift test` (110 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2.
 - CI runs on every push to `main`, every `v*` tag and every pull request, with three jobs:
   - macOS build and test, with warnings treated as errors
   - Linux build and test, in a Swift 6.0 container

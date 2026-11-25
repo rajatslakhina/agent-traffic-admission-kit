@@ -7,8 +7,11 @@ public struct GatewayRequest: Sendable {
     /// Required for writes. Reused on every retry of the same intent (see ``IntentKeyCache``).
     public let idempotencyKey: IdempotencyKey?
     /// Identifies the payload: the same key with a different fingerprint is a conflict. Any
-    /// length is accepted; the gateway stores only a fixed-size ``FingerprintDigest`` of it.
+    /// length is accepted; the gateway uses only a fixed-size ``FingerprintDigest`` of it.
     public let fingerprint: String
+    /// Computed here, on the caller's task, so hashing a long fingerprint never runs on (and
+    /// stalls) the gateway actor.
+    let fingerprintDigest: String
 
     public init(token: ScopeToken, capability: Capability, claimedCaller: CallerClass, idempotencyKey: IdempotencyKey?, fingerprint: String) {
         self.token = token
@@ -16,6 +19,7 @@ public struct GatewayRequest: Sendable {
         self.claimedCaller = claimedCaller
         self.idempotencyKey = idempotencyKey
         self.fingerprint = fingerprint
+        self.fingerprintDigest = FingerprintDigest.digest(fingerprint)
     }
 }
 
@@ -39,9 +43,10 @@ public enum GatewayOutcome<Value: Sendable>: Sendable {
     case shed(ShedReason, retryAfterMillis: Int64)
     case denied(AuthorizationFailure)
     case rejected(RequestRejection)
-    /// Another request with the same key is still running and this one stopped waiting for it
-    /// (too many waiters, the wait timed out, or this task was cancelled). The write may still
-    /// complete; retrying with the **same key** returns its result without running it twice.
+    /// An execution for this key is still running (started by this request or an earlier one)
+    /// and this request stopped waiting for it: too many waiters, the wait timed out, or this
+    /// task was cancelled. The write may still complete; retrying with the **same key** returns
+    /// its result without running it twice.
     case inProgress(retryAfterMillis: Int64)
     /// The handler ran and threw. It may or may not have had side effects (see README limits).
     case failed(HandlerFailure)
@@ -55,14 +60,19 @@ public struct ClassCounters: Sendable, Equatable {
     public var rejected = 0
     /// Served from a completed entry, or joined an in-flight execution that succeeded.
     public var replayed = 0
-    /// Duplicates that stopped waiting for an in-flight execution (``GatewayOutcome/inProgress(retryAfterMillis:)``).
+    /// Requests that stopped waiting for an in-flight execution and got
+    /// ``GatewayOutcome/inProgress(retryAfterMillis:)``: duplicates, and the request that
+    /// started the execution if it gave up first.
     public var inProgress = 0
     /// Of `shed`, how many were because the idempotency ledger was full of live records.
     public var ledgerFull = 0
     /// Times the handler actually ran.
     public var executed = 0
-    /// Handler threw, counted once for the request that ran it and once per joiner it failed.
+    /// Requests answered `.failed`: the one that started the execution (if still waiting) and
+    /// each joiner. See `executionsFailed` for a per-execution count.
     public var failed = 0
+    /// Handler runs that threw, counted once per execution even if nobody was still waiting.
+    public var executionsFailed = 0
     public init() {}
 }
 
@@ -244,8 +254,8 @@ public actor Gateway<Value: Sendable> {
             )
         }
 
-        // Fixed-size, whatever the caller sent, so a record's cost doesn't depend on the request.
-        let fingerprint = FingerprintDigest.digest(request.fingerprint)
+        // Fixed-size, whatever the caller sent, and already computed off the actor.
+        let fingerprint = request.fingerprintDigest
 
         // 3. Duplicates are served without admission: they cost a lookup, not a handler run.
         if let ledgerKey {
@@ -296,6 +306,7 @@ public actor Gateway<Value: Sendable> {
             // No key, no duplicates to share with: run inline, and let cancellation reach it.
             let result = await Self.run(operation)
             executing = max(0, executing - 1)
+            if case .failure = result { bump(traffic) { $0.executionsFailed += 1 } }
             return outcome(of: result, traffic: traffic)
         }
 
@@ -308,9 +319,10 @@ public actor Gateway<Value: Sendable> {
         nextWaiterID &+= 1
         Task { [self] in
             let result = await Self.run(operation)
-            self.finish(ledgerKey, result: result)
+            self.finish(ledgerKey, traffic: traffic, result: result)
         }
-        let result = await waitForResult(ledgerKey, id: id, isLeader: true, timeoutMillis: nil)
+        // Bounded like a joiner's wait: the execution has its own task, so giving up here is safe.
+        let result = await waitForResult(ledgerKey, id: id, isLeader: true, timeoutMillis: configuration.maxWaitMillis)
         guard let result else {
             bump(traffic) { $0.inProgress += 1 }
             return .inProgress(retryAfterMillis: retryHint)
@@ -337,11 +349,13 @@ public actor Gateway<Value: Sendable> {
     }
 
     /// Records a shared execution's result and wakes everyone waiting on it (leader included).
-    private func finish(_ key: LedgerKey, result: Result<Value, HandlerFailure>) {
+    private func finish(_ key: LedgerKey, traffic: TrafficClass, result: Result<Value, HandlerFailure>) {
         executing = max(0, executing - 1)
         switch result {
         case let .success(value): ledger.complete(key, value: value, now: clock.nowMillis())
-        case .failure: ledger.abandon(key)
+        case .failure:
+            ledger.abandon(key)
+            bump(traffic) { $0.executionsFailed += 1 }
         }
         let waiting = waiters.removeValue(forKey: key) ?? []
         for waiter in waiting { waiter.continuation.resume(returning: result) }
@@ -390,6 +404,8 @@ public actor Gateway<Value: Sendable> {
             let timeoutNanos = timeout.overflow ? UInt64.max : timeout.partialValue
             timer = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: timeoutNanos)
+                // Cancelled because the result arrived: skip the pointless actor hop.
+                guard !Task.isCancelled else { return }
                 await self?.stopWaiting(key, id: id)
             }
         }
