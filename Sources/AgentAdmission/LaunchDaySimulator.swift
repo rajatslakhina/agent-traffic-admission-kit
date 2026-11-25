@@ -477,8 +477,10 @@ private struct Engine {
         // spending a bucket token, and release the claim if the policy then sheds.
         if keyed(i), ledger.begin(i, fingerprint: "", now: now) != .started {
             reports[traffic]?.shed += 1
-            let wait = ledger.millisUntilReclaim(now: now) ?? Self.ledgerRetryCeiling
-            failAttempt(i, attempt: attempt, retryAfter: Saturating.clamp(wait, Self.ledgerRetryFloor, Self.ledgerRetryCeiling), now: now)
+            sample(now) { s in
+                if traffic.caller.isAgentOriginated { s.shedAgent += 1 } else { s.shedHuman += 1 }
+            }
+            failAttempt(i, attempt: attempt, retryAfter: ledgerFullHint(now: now), now: now)
             return
         }
         let load = LoadSignal(queueDepth: queue.count, workers: profile.workers, meanServiceMillis: meanService)
@@ -501,9 +503,18 @@ private struct Engine {
         }
     }
 
-    /// Retry-After bounds for a full ledger, matching ``ClassAwarePolicy/Configuration/standard``.
-    static let ledgerRetryFloor: Int64 = 250
-    static let ledgerRetryCeiling: Int64 = 30_000
+    /// The hint the setup's policy would give for a full ledger: time until a record expires,
+    /// clamped to the class-aware policy's bounds; the class-blind baseline gives no hint (0).
+    func ledgerFullHint(now: Int64) -> Int64 {
+        switch setup.policy {
+        case .classBlindFIFO:
+            return 0
+        case let .classAware(config):
+            let floor = max(1, config.minRetryAfterMillis)
+            let ceiling = max(floor, config.maxRetryAfterMillis)
+            return Saturating.clamp(ledger.millisUntilReclaim(now: now) ?? ceiling, floor, ceiling)
+        }
+    }
 
     /// Writes carry an idempotency key when the setup uses keys; reads never do (as with the Gateway).
     func keyed(_ i: Int) -> Bool {

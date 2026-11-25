@@ -98,12 +98,13 @@ A grant can be revoked at any time. If a request claims `.interactiveUI` with a 
 - **Joining is bounded.** There are at most `maxWaitersPerKey` waiters, each waits at most `maxWaitMillis`, and cancelled waiters are removed. A waiter that stops waiting gets `.inProgress`, which tells the client to retry with the same key, never to start over.
 - **A different payload is a conflict.** The same key with a different payload fingerprint is a **conflict**. Replaying the old result for a new request would be silently wrong.
 - **Nothing unexpired is ever evicted, in flight or completed.** Evicting a completed record early would turn the retry of a lost response into a double charge. A full ledger sheds new writes instead of running them unprotected, with a `Retry-After` of the time until its earliest record expires (not a fixed 250 ms that would invite a retry storm), and counts them as `ledgerFull`.
-- **A full ledger stays cheap.** Expired records are reclaimed through an expiry heap, so a ledger that sits full under sustained load costs O(log n) per reclaimed record, never a table scan on the actor. Payload fingerprints are stored as a fixed 128-bit `FingerprintDigest`, so a record costs the same whatever the caller sent, and `IdempotencyKey` validates on decode as well as on init.
+- **A full ledger stays cheap.** Expired records are reclaimed through an expiry heap, one slot per request, so a ledger that sits full under sustained load costs amortised O(log n) per request, never a table scan on the actor, and a whole burst expiring at once isn't paid for by one unlucky request. Tests bound this by counting the keys each operation touches. Payload fingerprints are stored as a fixed 128-bit `FingerprintDigest`, so a record costs the same whatever the caller sent, and `IdempotencyKey` validates on decode as well as on init.
 
 **5. No `await` between "is this key known?" and "this key is mine".** `Gateway` is an actor, and actor reentrancy happens only at suspension points.
 
 - Authorization, ledger lookup, claiming the key and admission all run synchronously. The key is claimed before the policy runs, so a full ledger sheds without spending a bucket token, and a policy shed releases the claim.
-- There are exactly two suspensions: the handler call, and a duplicate's wait for it. Neither sits between lookup and claim, and state is re-read after each.
+- The only suspensions are the handler call and waiting for a keyed execution's result. Neither sits between lookup and claim, and state is re-read after each.
+- A keyed execution runs in its own task, and the request that started it waits for it exactly like a duplicate does. If that caller gives up (Siri times out, the connection drops), it gets `.inProgress`; the write isn't cut off halfway, and the duplicates sharing it still get the result.
 - `testFiftyConcurrentRetriesOfOneWriteExecuteTheHandlerOnce` sends fifty concurrent copies of the same write, and the handler runs exactly once. A control test proves the same harness really does overlap handlers when there's no key.
 
 **6. Shed strictly before execution, so the spoken fallback tells the truth about this attempt.** `FallbackPresenter` builds every sentence from what the outcome guarantees *for this attempt*. It never claims an earlier attempt did nothing, because it can't know that.
@@ -127,6 +128,7 @@ A grant can be revoked at any time. If a request claims `.interactiveUI` with a 
 | Another principal presents your key | They get a separate record and can't read your result |
 | Same key, different payload | `.rejected(.idempotencyConflict)`, and nothing runs |
 | Handler throws | Not cached. Joiners get the failure, and the next retry runs again |
+| The caller that started a write cancels | The write keeps running in its own task; that caller gets `.inProgress`, joiners and retries get the result |
 | Ledger full of unexpired records | The write is shed (counted as `ledgerFull`) with `Retry-After` = time until a record expires, instead of running unprotected |
 | Client gave up while queued *(simulator)* | The work is skipped at dequeue. It never ran, so this is safe |
 | Token for another class or skill, expired, or revoked | Denied before anything else |
@@ -231,7 +233,7 @@ if let fallback = FallbackPresenter.fallback(for: outcome, kind: .write, action:
 Add it with SwiftPM:
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/agent-traffic-admission-kit.git", from: "2.2.0")
+.package(url: "https://github.com/rajatslakhina/agent-traffic-admission-kit.git", from: "2.3.0")
 ```
 
 ## Honest limits
@@ -254,7 +256,7 @@ Add it with SwiftPM:
 
 ## Verification
 
-- `swift build -Xswiftc -warnings-as-errors` and `swift test` (104 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2.
+- `swift build -Xswiftc -warnings-as-errors` and `swift test` (108 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2.
 - CI runs on every push to `main`, every `v*` tag and every pull request, with three jobs:
   - macOS build and test, with warnings treated as errors
   - Linux build and test, in a Swift 6.0 container

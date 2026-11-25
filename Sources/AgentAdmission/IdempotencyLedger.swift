@@ -43,9 +43,10 @@ public struct IdempotencyKey: Hashable, Sendable, Codable, CustomStringConvertib
 }
 
 /// A fixed-size digest of a caller-supplied payload fingerprint, so a ledger record costs the
-/// same whatever the caller sent. Two independent 64-bit FNV-1a hashes (128 bits); not
-/// cryptographic, which is acceptable because records are scoped per principal: a crafted
-/// collision can only confuse the crafter's own records.
+/// same whatever the caller sent. Two differently seeded and mixed 64-bit FNV-1a variants
+/// (128 bits). Not cryptographic, and it doesn't need to be: the fingerprint is caller-supplied
+/// and records are scoped per principal, so a collision gives a caller nothing it couldn't
+/// already do to its own records by choosing the fingerprint.
 public enum FingerprintDigest {
     public static func digest(_ fingerprint: String) -> String {
         var a: UInt64 = 0xcbf2_9ce4_8422_2325
@@ -76,8 +77,8 @@ public enum FingerprintDigest {
 ///   early would turn a retry of a lost response into a second execution. When the ledger is
 ///   full of live entries, ``begin(_:fingerprint:now:)`` returns ``BeginResult/full`` and the
 ///   caller sheds the request instead of running it unprotected (fail closed). Size `capacity`
-///   for peak writes × TTL. Expired records are reclaimed through an expiry heap, so a full
-///   ledger costs O(log n) per reclaimed record, never a table scan.
+///   for peak writes × TTL. Expired records are reclaimed through an expiry heap, one slot per
+///   `begin`, so a full ledger costs amortised O(log n) per request, never a table scan.
 /// * A key reused with a **different fingerprint** (a different payload) is a conflict, not a
 ///   replay: replaying the old result for a new request would be silently wrong.
 /// * Failures are **not** cached: ``abandon(_:)`` drops the entry, so the client's next retry
@@ -117,7 +118,7 @@ public struct IdempotencyLedger<Key: Hashable & Sendable, Value: Sendable>: Send
     /// Completed records ordered by expiry, so reclaiming is amortised O(log n) per record and
     /// never a scan of the whole table, even when the ledger sits full under sustained load.
     private var expiries = ExpiryHeap<Key>()
-    /// Number of full-table scans (``purgeExpired(now:)`` calls). `begin` never scans. Exposed for tests.
+    /// Number of ``purgeExpired(now:)`` calls (the only full-table sweep; `begin` never calls it).
     public private(set) var purgeScans = 0
 
     public init(capacity: Int, ttlMillis: Int64) {
@@ -196,10 +197,14 @@ public struct IdempotencyLedger<Key: Hashable & Sendable, Value: Sendable>: Send
         compactIfMostlyStale()
     }
 
-    /// Pops expired pairs off the heap and removes the records they still describe. A pair is
-    /// stale (skipped) if its record was already removed or re-recorded with another expiry.
+    /// Pops expired pairs off the heap until one slot is free, removing the records they still
+    /// describe. A pair is stale (skipped) if its record was already removed or re-recorded with
+    /// another expiry. Amortised O(log n) per reclaimed record; stale pairs are bounded by
+    /// compaction.
     private mutating func reclaimExpired(now: Int64) {
-        while let (expiresAt, key) = expiries.popExpired(now: now) {
+        // Free only what this `begin` needs: one slot. A whole burst expiring at once is then
+        // reclaimed one record per request, not all at once on one unlucky request.
+        while entries.count >= capacity, let (expiresAt, key) = expiries.popExpired(now: now) {
             if case let .completed(_, current)? = entries[key]?.state, current == expiresAt {
                 entries[key] = nil
             }

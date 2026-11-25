@@ -326,6 +326,40 @@ final class GatewayTests: XCTestCase {
         guard case .rejected(.idempotencyConflict) = other else { return XCTFail("got \(other)") }
     }
 
+    /// The leader's client giving up must not cancel work that duplicates are sharing.
+    func testCancellingTheLeaderNeitherCancelsTheSharedWriteNorFailsItsJoiners() async throws {
+        let (gateway, _) = makeGateway()
+        let tok = try await token(gateway, caller: .siriAgent, caps: [reorder])
+        let probe = Probe()
+        let request = GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: .mint(), fingerprint: "p")
+        let leader = Task {
+            await gateway.handle(request) {
+                await probe.enter()
+                try await Task.sleep(nanoseconds: 400_000_000)   // throws if this task is cancelled
+                await probe.leave()
+                return 42
+            }
+        }
+        var polls = 0
+        while await gateway.executingCount == 0, polls < 500 {
+            polls += 1
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        async let joiner = gateway.handle(request) { 0 }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        leader.cancel()
+        let leaderOutcome = await leader.value
+        guard case .inProgress = leaderOutcome else { return XCTFail("cancelled leader should get inProgress, got \(leaderOutcome)") }
+        let joined = await joiner
+        guard case .success(42, replayed: true) = joined else { return XCTFail("joiner should get the shared result, got \(joined)") }
+        let retry = await gateway.handle(request) { 0 }
+        guard case .success(42, replayed: true) = retry else { return XCTFail("retry should replay, got \(retry)") }
+        let runs = await probe.runs
+        let running = await probe.running
+        XCTAssertEqual(runs, 1)
+        XCTAssertEqual(running, 0, "the handler ran to completion instead of being cancelled")
+    }
+
     func testRelativeIssueExpiresOnTheGatewaysOwnClock() async throws {
         let clock = ManualClock(startingAt: 1_000_000)
         let gateway = Gateway<Int>(clock: clock)
@@ -464,7 +498,7 @@ final class FallbackPresenterTests: XCTestCase {
         }
     }
 
-    func testInProgressPromisesNoDoubleRunAndDoesNotClaimNothingHappened() {
+    func testInProgressSaysItWontRestartWhileRunningAndDoesNotClaimNothingHappened() {
         let f = FallbackPresenter.fallback(for: GatewayOutcome<Int>.inProgress(retryAfterMillis: 250), kind: .write, action: "place your order")
         XCTAssertTrue(f?.spoken.contains("won't start it again while it's running") ?? false)
         XCTAssertEqual(f?.mayHaveExecuted, true)

@@ -89,9 +89,11 @@ struct LedgerKey: Hashable, Sendable {
 ///
 /// Everything between reading the ledger and marking a key in flight happens without an `await`,
 /// so two concurrent requests with the same key cannot both decide to execute (actor
-/// reentrancy only happens at suspension points, and there are none in that window). There are
-/// exactly two suspensions, the handler call and a duplicate's wait for it, and neither sits
-/// between lookup and claim; state is re-read after each, never assumed.
+/// reentrancy only happens at suspension points, and there are none in that window). The only
+/// suspensions are the handler call (inline for unkeyed requests) and waiting for a keyed
+/// execution's result (the leader and duplicates alike); none sits between lookup and claim, and
+/// state is re-read after each, never assumed. A keyed execution runs in its own task, so one
+/// caller's cancellation never cancels work other callers are sharing.
 ///
 /// This is a single-process reference implementation: it is meant to run in a server-side
 /// Swift process (or to be ported to one), and the demo app runs it in-process to make the
@@ -146,6 +148,9 @@ public actor Gateway<Value: Sendable> {
 
     private struct Waiter {
         let id: UInt64
+        /// The request that started the execution waits on it like a duplicate does, so its
+        /// own cancellation can't cancel the shared work. Leaders don't count toward the cap.
+        let isLeader: Bool
         let continuation: CheckedContinuation<Result<Value, HandlerFailure>?, Never>
     }
 
@@ -211,7 +216,7 @@ public actor Gateway<Value: Sendable> {
 
     public func handle(
         _ request: GatewayRequest,
-        operation: @Sendable () async throws -> Value
+        operation: @escaping @Sendable () async throws -> Value
     ) async -> GatewayOutcome<Value> {
         let now = clock.nowMillis()
 
@@ -286,24 +291,42 @@ public actor Gateway<Value: Sendable> {
 
         bump(traffic) { $0.admitted += 1; $0.executed += 1 }
         executing += 1
-        let result: Result<Value, HandlerFailure>
+
+        guard let ledgerKey else {
+            // No key, no duplicates to share with: run inline, and let cancellation reach it.
+            let result = await Self.run(operation)
+            executing = max(0, executing - 1)
+            return outcome(of: result, traffic: traffic)
+        }
+
+        // 6. A keyed execution is shared with every duplicate that joins it, so it runs in its
+        //    own task: the leader's client cancelling (Siri giving up, a dropped connection) must
+        //    not cut the write off halfway or fail healthy joiners. The leader then waits for it
+        //    exactly like a joiner. Its waiter is registered below before this actor can run the
+        //    task's completion, so the result can't be missed.
+        let id = nextWaiterID
+        nextWaiterID &+= 1
+        Task { [self] in
+            let result = await Self.run(operation)
+            self.finish(ledgerKey, result: result)
+        }
+        let result = await waitForResult(ledgerKey, id: id, isLeader: true, timeoutMillis: nil)
+        guard let result else {
+            bump(traffic) { $0.inProgress += 1 }
+            return .inProgress(retryAfterMillis: retryHint)
+        }
+        return outcome(of: result, traffic: traffic)
+    }
+
+    private static func run(_ operation: @Sendable () async throws -> Value) async -> Result<Value, HandlerFailure> {
         do {
-            result = .success(try await operation())
+            return .success(try await operation())
         } catch {
-            result = .failure(HandlerFailure(message: String(describing: error)))
+            return .failure(HandlerFailure(message: String(describing: error)))
         }
-        // Re-entered after the suspension: re-read everything below from actor state.
-        executing = max(0, executing - 1)
+    }
 
-        if let ledgerKey {
-            switch result {
-            case let .success(value): ledger.complete(ledgerKey, value: value, now: clock.nowMillis())
-            case .failure: ledger.abandon(ledgerKey)
-            }
-            let joined = waiters.removeValue(forKey: ledgerKey) ?? []
-            for waiter in joined { waiter.continuation.resume(returning: result) }
-        }
-
+    private func outcome(of result: Result<Value, HandlerFailure>, traffic: TrafficClass) -> GatewayOutcome<Value> {
         switch result {
         case let .success(value):
             return .success(value, replayed: false)
@@ -311,6 +334,17 @@ public actor Gateway<Value: Sendable> {
             bump(traffic) { $0.failed += 1 }
             return .failed(failure)
         }
+    }
+
+    /// Records a shared execution's result and wakes everyone waiting on it (leader included).
+    private func finish(_ key: LedgerKey, result: Result<Value, HandlerFailure>) {
+        executing = max(0, executing - 1)
+        switch result {
+        case let .success(value): ledger.complete(key, value: value, now: clock.nowMillis())
+        case .failure: ledger.abandon(key)
+        }
+        let waiting = waiters.removeValue(forKey: key) ?? []
+        for waiter in waiting { waiter.continuation.resume(returning: result) }
     }
 
     // MARK: Joining an in-flight execution
@@ -321,34 +355,17 @@ public actor Gateway<Value: Sendable> {
         Saturating.clamp(millis, retryHint, max(retryHint, configuration.policy.maxRetryAfterMillis))
     }
 
-    /// Waits for the in-flight execution of `key`, bounded in count, time and by cancellation.
+    /// A duplicate waits for the in-flight execution of `key`, bounded in count, time and by
+    /// cancellation.
     private func join(_ key: LedgerKey, traffic: TrafficClass) async -> GatewayOutcome<Value> {
-        guard (waiters[key]?.count ?? 0) < max(0, configuration.maxWaitersPerKey) else {
+        let joined = waiters[key]?.reduce(0) { $0 + ($1.isLeader ? 0 : 1) } ?? 0
+        guard joined < max(0, configuration.maxWaitersPerKey) else {
             bump(traffic) { $0.inProgress += 1 }
             return .inProgress(retryAfterMillis: retryHint)
         }
         let id = nextWaiterID
         nextWaiterID &+= 1
-        let timeout = UInt64(max(0, configuration.maxWaitMillis)).multipliedReportingOverflow(by: 1_000_000)
-        let timeoutNanos = timeout.overflow ? UInt64.max : timeout.partialValue
-        let timer = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: timeoutNanos)
-            await self?.stopWaiting(key, id: id)
-        }
-        defer { timer.cancel() }
-
-        let result: Result<Value, HandlerFailure>? = await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                if Task.isCancelled {
-                    continuation.resume(returning: nil)
-                } else {
-                    waiters[key, default: []].append(Waiter(id: id, continuation: continuation))
-                }
-            }
-        } onCancel: {
-            Task { [weak self] in await self?.stopWaiting(key, id: id) }
-        }
-
+        let result = await waitForResult(key, id: id, isLeader: false, timeoutMillis: configuration.maxWaitMillis)
         switch result {
         case let .success(value)?:
             bump(traffic) { $0.replayed += 1 }
@@ -359,6 +376,35 @@ public actor Gateway<Value: Sendable> {
         case nil:
             bump(traffic) { $0.inProgress += 1 }
             return .inProgress(retryAfterMillis: retryHint)
+        }
+    }
+
+    /// Suspends until `finish` resumes this waiter (the result) or it stops waiting (`nil`:
+    /// timeout, or the calling task was cancelled).
+    private func waitForResult(
+        _ key: LedgerKey, id: UInt64, isLeader: Bool, timeoutMillis: Int64?
+    ) async -> Result<Value, HandlerFailure>? {
+        var timer: Task<Void, Never>?
+        if let timeoutMillis {
+            let timeout = UInt64(max(0, timeoutMillis)).multipliedReportingOverflow(by: 1_000_000)
+            let timeoutNanos = timeout.overflow ? UInt64.max : timeout.partialValue
+            timer = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: timeoutNanos)
+                await self?.stopWaiting(key, id: id)
+            }
+        }
+        defer { timer?.cancel() }
+
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: nil)
+                } else {
+                    waiters[key, default: []].append(Waiter(id: id, isLeader: isLeader, continuation: continuation))
+                }
+            }
+        } onCancel: {
+            Task { [weak self] in await self?.stopWaiting(key, id: id) }
         }
     }
 
@@ -376,7 +422,8 @@ public actor Gateway<Value: Sendable> {
     public func countersByClass() -> [TrafficClass: ClassCounters] { counters }
     public var executingCount: Int { executing }
     public var ledgerCount: Int { ledger.count }
-    public var waiterCount: Int { waiters.values.reduce(0) { $0 + $1.count } }
+    /// Duplicates currently waiting (leaders waiting on their own execution aren't counted).
+    public var waiterCount: Int { waiters.values.reduce(0) { acc, list in acc + list.reduce(0) { $0 + ($1.isLeader ? 0 : 1) } } }
 
     private func bump(_ traffic: TrafficClass, _ change: (inout ClassCounters) -> Void) {
         var c = counters[traffic] ?? ClassCounters()

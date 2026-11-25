@@ -1,6 +1,25 @@
 import XCTest
 @testable import AgentAdmission
 
+/// Counts hashing and equality work, so a test can bound how many keys an operation touches.
+/// `@unchecked Sendable` is sound here: each test uses its own instance from a single thread.
+private final class WorkCounter: @unchecked Sendable {
+    var touches = 0
+}
+
+private struct CountingKey: Hashable, Sendable {
+    let id: Int
+    let counter: WorkCounter
+    func hash(into hasher: inout Hasher) {
+        counter.touches += 1
+        hasher.combine(id)
+    }
+    static func == (a: CountingKey, b: CountingKey) -> Bool {
+        a.counter.touches += 1
+        return a.id == b.id
+    }
+}
+
 private func key(_ s: String) -> IdempotencyKey {
     guard let k = IdempotencyKey(s) else { preconditionFailure("test key \(s) is invalid") }
     return k
@@ -51,23 +70,21 @@ final class IdempotencyLedgerTests: XCTestCase {
         guard case .absent = ledger.lookup(key("paid"), fingerprint: "f", now: 1_000) else { return XCTFail("expired") }
     }
 
-    /// A full ledger must refuse without scanning the table, and reclaim an expired slot without one too.
-    func testFullLedgerRefusesWithoutScanningAndReclaimsOnExpiry() {
+    /// A full ledger refuses until a record expires, then admits into the reclaimed slot.
+    func testFullLedgerRefusesUntilARecordExpires() {
         var ledger = IdempotencyLedger<Int, Int>(capacity: 2, ttlMillis: 1_000)
         for k in 0..<2 {
             _ = ledger.begin(k, fingerprint: "", now: 0)
             ledger.complete(k, value: k, now: 0)
         }
         for i in 0..<100 { XCTAssertEqual(ledger.begin(100 + i, fingerprint: "", now: 500), .full) }
-        XCTAssertEqual(ledger.purgeScans, 0)
-        // Once a record expires its slot is reclaimed through the expiry heap, still without a scan.
         XCTAssertEqual(ledger.begin(999, fingerprint: "", now: 1_000), .started)
-        XCTAssertEqual(ledger.purgeScans, 0)
+        XCTAssertEqual(ledger.count, 2)
     }
 
     /// The saturated steady state: the ledger stays full while records expire one by one and
-    /// new writes take their slots. Reclaiming must come from the expiry heap, never a scan.
-    func testSaturatedLedgerReclaimsWithoutEverScanningTheTable() {
+    /// new writes take their slots. (Work per request is bounded in the CountingKey tests below.)
+    func testSaturatedLedgerKeepsAdmittingAsRecordsExpire() {
         // TTL equals capacity in ms, so with one write per ms exactly one record expires per step.
         var ledger = IdempotencyLedger<Int, Int>(capacity: 100, ttlMillis: 100)
         for k in 0..<100 {
@@ -81,7 +98,59 @@ final class IdempotencyLedgerTests: XCTestCase {
             ledger.complete(10_000 + step, value: step, now: now)
             XCTAssertLessThanOrEqual(ledger.count, 100)
         }
-        XCTAssertEqual(ledger.purgeScans, 0)
+        XCTAssertEqual(ledger.count, 100)
+    }
+
+    /// Measures work, not a call count: rebuilding the table (the 2.1.0 bug) would touch all
+    /// 10,000 keys; reclaiming through the heap touches a handful.
+    func testReclaimingOneSlotInAFullTenThousandEntryLedgerTouchesAHandfulOfKeys() {
+        let counter = WorkCounter()
+        var ledger = IdempotencyLedger<CountingKey, Int>(capacity: 10_000, ttlMillis: 1_000)
+        for i in 0..<10_000 {
+            let k = CountingKey(id: i, counter: counter)
+            _ = ledger.begin(k, fingerprint: "", now: Int64(i))
+            ledger.complete(k, value: i, now: Int64(i))
+        }
+        // At 1_000 exactly one record (completed at 0) has expired.
+        counter.touches = 0
+        XCTAssertEqual(ledger.begin(CountingKey(id: -1, counter: counter), fingerprint: "", now: 1_000), .started)
+        XCTAssertLessThanOrEqual(counter.touches, 100)
+        XCTAssertEqual(ledger.count, 10_000)
+    }
+
+    /// When a whole burst expires at once, one `begin` frees one slot instead of paying for all
+    /// of them on a single request.
+    func testAMassExpiryIsReclaimedOneSlotPerBegin() {
+        let counter = WorkCounter()
+        var ledger = IdempotencyLedger<CountingKey, Int>(capacity: 5_000, ttlMillis: 1_000)
+        for i in 0..<5_000 {
+            let k = CountingKey(id: i, counter: counter)
+            _ = ledger.begin(k, fingerprint: "", now: 0)
+            ledger.complete(k, value: i, now: 0)
+        }
+        counter.touches = 0
+        XCTAssertEqual(ledger.begin(CountingKey(id: -1, counter: counter), fingerprint: "", now: 10_000), .started)
+        XCTAssertLessThanOrEqual(counter.touches, 100)
+        XCTAssertEqual(ledger.count, 5_000, "only one expired record was reclaimed")
+    }
+
+    func testSaturatedSteadyStateWorkStaysBoundedPerRequest() {
+        let counter = WorkCounter()
+        var ledger = IdempotencyLedger<CountingKey, Int>(capacity: 2_000, ttlMillis: 2_000)
+        for i in 0..<2_000 {
+            let k = CountingKey(id: i, counter: counter)
+            _ = ledger.begin(k, fingerprint: "", now: Int64(i))
+            ledger.complete(k, value: i, now: Int64(i))
+        }
+        counter.touches = 0
+        for step in 0..<3_000 {
+            let now = Int64(2_000 + step)
+            let k = CountingKey(id: 100_000 + step, counter: counter)
+            XCTAssertEqual(ledger.begin(k, fingerprint: "", now: now), .started)
+            ledger.complete(k, value: step, now: now)
+        }
+        // A table rebuild per request would be ~2,000 touches each, 6,000,000 in total.
+        XCTAssertLessThanOrEqual(counter.touches, 3_000 * 100)
     }
 
     func testMillisUntilReclaimPointsAtTheEarliestExpiry() {

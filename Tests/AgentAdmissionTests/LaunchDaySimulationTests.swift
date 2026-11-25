@@ -57,6 +57,12 @@ final class LaunchDaySimulationTests: XCTestCase {
         XCTAssertEqual(Self.aware.aggregate(.shortcut).successPercentText, "62.9%")
         XCTAssertEqual(Self.aware.aggregate(.siriAgent).failed, 1_086)   // README: 30.0% of 3,615
         XCTAssertEqual(Self.aware.aggregate(.shortcut).failed, 398)      // README: 37.1% of 1,074
+        // README: on the class-aware side every remaining duplicate run is a read retried after a
+        // lost response, so per class, read duplicates never exceed lost read responses.
+        for r in Self.aware.perClass {
+            if r.traffic.kind == .write { XCTAssertEqual(r.duplicateExecutions, 0, "\(r.traffic)") }
+            else { XCTAssertLessThanOrEqual(r.duplicateExecutions, r.lostResponses, "\(r.traffic)") }
+        }
         XCTAssertEqual(Self.naive.summary(), Self.naiveSummary)
         XCTAssertEqual(Self.aware.summary(), Self.awareSummary)
     }
