@@ -233,7 +233,7 @@ if let fallback = FallbackPresenter.fallback(for: outcome, kind: .write, action:
 Add it with SwiftPM:
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/agent-traffic-admission-kit.git", from: "2.4.0")
+.package(url: "https://github.com/rajatslakhina/agent-traffic-admission-kit.git", from: "2.4.1")
 ```
 
 ## Honest limits
@@ -256,7 +256,7 @@ Add it with SwiftPM:
 
 ## Verification
 
-- `swift build -Xswiftc -warnings-as-errors` and `swift test` (110 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2.
+- `swift build -Xswiftc -warnings-as-errors` and `swift test` (112 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2.
 - CI runs on every push to `main`, every `v*` tag and every pull request, with three jobs:
   - macOS build and test, with warnings treated as errors
   - Linux build and test, in a Swift 6.0 container

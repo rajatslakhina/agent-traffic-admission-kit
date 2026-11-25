@@ -123,7 +123,9 @@ public actor Gateway<Value: Sendable> {
         public var ledgerTTLMillis: Int64
         /// Most duplicates allowed to wait on one in-flight key; more get `.inProgress`.
         public var maxWaitersPerKey: Int
-        /// Longest a duplicate waits for the in-flight execution before returning `.inProgress`.
+        /// Longest any request waits for a keyed execution (the one that started it or a
+        /// duplicate) before returning `.inProgress`; the execution itself keeps running.
+        /// Must be at least 1: zero would answer every keyed request `.inProgress`.
         public var maxWaitMillis: Int64
 
         public init(
@@ -151,7 +153,7 @@ public actor Gateway<Value: Sendable> {
             if ledgerCapacity < 1 { issues.append("ledgerCapacity must be at least 1") }
             if ledgerTTLMillis < 1 { issues.append("ledgerTTLMillis must be at least 1") }
             if maxWaitersPerKey < 0 { issues.append("maxWaitersPerKey must not be negative") }
-            if maxWaitMillis < 0 { issues.append("maxWaitMillis must not be negative") }
+            if maxWaitMillis < 1 { issues.append("maxWaitMillis must be at least 1 (0 would answer every keyed request .inProgress)") }
             return issues
         }
     }

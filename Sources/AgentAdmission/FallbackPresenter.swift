@@ -44,7 +44,7 @@ public enum FallbackPresenter {
         case let .inProgress(retryAfterMillis):
             let seconds = wholeSeconds(retryAfterMillis)
             return UserFacingFallback(
-                spoken: "I'm still working on that, and I won't start it again while it's running. Ask me again in a few seconds and I'll tell you how it went.",
+                spoken: "I'm still working on that, and I won't start it again while it's running. Check again in a few seconds.",
                 visual: "Still in progress — check again shortly.",
                 retryAfterSeconds: seconds,
                 mayHaveExecuted: true

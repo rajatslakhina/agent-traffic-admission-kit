@@ -12,6 +12,21 @@ private actor Probe {
 
 private struct Boom: Error {}
 
+/// Suspends handlers until the test opens it.
+private actor Gate {
+    private var isOpen = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiting.append($0) }
+    }
+    func open() {
+        isOpen = true
+        for c in waiting { c.resume() }
+        waiting.removeAll()
+    }
+}
+
 final class GatewayTests: XCTestCase {
     let reorder = Capability("orders", .write)
     let browse = Capability("menu", .read)
@@ -185,18 +200,30 @@ final class GatewayTests: XCTestCase {
         let (gateway, _) = makeGateway(config)
         let tok = try await token(gateway, caller: .siriAgent, caps: [reorder])
         let probe = Probe()
+        let gate = Gate()
         let request = GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: .mint(), fingerprint: "p")
         let outcomes = await withTaskGroup(of: GatewayOutcome<Int>.self) { group in
             for _ in 0..<10 {
                 group.addTask {
                     await gateway.handle(request) {
                         await probe.enter()
-                        try await Task.sleep(nanoseconds: 400_000_000)
+                        await gate.wait()   // held open until every request has been answered or parked
                         await probe.leave()
                         return 5
                     }
                 }
             }
+            // No timing assumption: release the handler only once 2 duplicates are parked and the
+            // other 7 have been turned away, however slowly the runner schedules the children.
+            var polls = 0
+            while polls < 5_000 {
+                let parked = await gateway.waiterCount
+                let turnedAway = await gateway.countersByClass()[TrafficClass(.siriAgent, .write)]?.inProgress ?? 0
+                if parked == 2 && turnedAway == 7 { break }
+                polls += 1
+                try? await Task.sleep(nanoseconds: 2_000_000)
+            }
+            await gate.open()
             var all: [GatewayOutcome<Int>] = []
             for await o in group { all.append(o) }
             return all
@@ -408,6 +435,25 @@ final class GatewayTests: XCTestCase {
         XCTAssertEqual(counters?.inProgress, 1)
     }
 
+    func testAnUnkeyedHandlerFailureIsCountedOnceAndReleasesItsSlot() async throws {
+        let (gateway, _) = makeGateway()
+        let tok = try await token(gateway, caller: .siriAgent, caps: [browse])
+        let request = GatewayRequest(token: tok, capability: browse, claimedCaller: .siriAgent, idempotencyKey: nil, fingerprint: "")
+        let outcome = await gateway.handle(request) { throw Boom() }
+        guard case .failed = outcome else { return XCTFail("got \(outcome)") }
+        let counters = await gateway.countersByClass()[TrafficClass(.siriAgent, .read)]
+        XCTAssertEqual(counters?.executionsFailed, 1)
+        XCTAssertEqual(counters?.failed, 1)
+        let executing = await gateway.executingCount
+        XCTAssertEqual(executing, 0)
+    }
+
+    func testValidationRejectsAZeroMaxWait() {
+        var config = Gateway<Int>.Configuration()
+        config.maxWaitMillis = 0
+        XCTAssertTrue(config.validationIssues().contains { $0.contains("maxWaitMillis") })
+    }
+
     func testRelativeIssueExpiresOnTheGatewaysOwnClock() async throws {
         let clock = ManualClock(startingAt: 1_000_000)
         let gateway = Gateway<Int>(clock: clock)
@@ -549,6 +595,8 @@ final class FallbackPresenterTests: XCTestCase {
     func testInProgressSaysItWontRestartWhileRunningAndDoesNotClaimNothingHappened() {
         let f = FallbackPresenter.fallback(for: GatewayOutcome<Int>.inProgress(retryAfterMillis: 250), kind: .write, action: "place your order")
         XCTAssertTrue(f?.spoken.contains("won't start it again while it's running") ?? false)
+        // A failed execution is abandoned and a retry runs again, so promise nothing about the outcome.
+        XCTAssertFalse(f?.spoken.contains("how it went") ?? true)
         XCTAssertEqual(f?.mayHaveExecuted, true)
         XCTAssertEqual(f?.retryAfterSeconds, 1)
         XCTAssertFalse(f?.spoken.contains("didn't go through") ?? true)

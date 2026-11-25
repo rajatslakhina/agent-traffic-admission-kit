@@ -139,7 +139,8 @@ public struct ClassReport: Sendable, Equatable, Identifiable {
     public internal(set) var attempts = 0
     public internal(set) var shed = 0
     public internal(set) var timedOut = 0
-    /// Retries answered from the idempotency ledger (completed replay or joined in-flight).
+    /// Retries that found an existing ledger record: a completed replay, or a join of the
+    /// in-flight execution (counted when it joins, even if that attempt later times out).
     public internal(set) var replayed = 0
     /// Queued work skipped because its client had already stopped waiting.
     public internal(set) var droppedExpired = 0
