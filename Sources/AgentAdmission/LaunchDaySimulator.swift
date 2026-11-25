@@ -473,21 +473,24 @@ private struct Engine {
             }
         }
 
+        // Same composition as the Gateway: claim the key first, so a full ledger sheds without
+        // spending a bucket token, and release the claim if the policy then sheds.
+        if keyed(i), ledger.begin(i, fingerprint: "", now: now) != .started {
+            reports[traffic]?.shed += 1
+            let wait = ledger.millisUntilReclaim(now: now) ?? Self.ledgerRetryCeiling
+            failAttempt(i, attempt: attempt, retryAfter: Saturating.clamp(wait, Self.ledgerRetryFloor, Self.ledgerRetryCeiling), now: now)
+            return
+        }
         let load = LoadSignal(queueDepth: queue.count, workers: profile.workers, meanServiceMillis: meanService)
         switch policy.decide(traffic, load: load, now: now) {
         case let .shed(_, retryAfter):
+            if keyed(i) { ledger.abandon(i) }
             reports[traffic]?.shed += 1
             sample(now) { s in
                 if traffic.caller.isAgentOriginated { s.shedAgent += 1 } else { s.shedHuman += 1 }
             }
             failAttempt(i, attempt: attempt, retryAfter: retryAfter, now: now)
         case let .admit(priority):
-            if keyed(i), ledger.begin(i, fingerprint: "", now: now) != .started {
-                // Ledger full of live records: shed rather than run unprotected.
-                reports[traffic]?.shed += 1
-                failAttempt(i, attempt: attempt, retryAfter: 250, now: now)
-                return
-            }
             let job = Job(id: jobs.count, intent: i, attempt: attempt, priority: priority, seq: nextSeq(), service: profile.serviceMillis(for: traffic.kind))
             jobs.append(job)
             if keyed(i) { intents[i].inFlightJob = job.id }
@@ -497,6 +500,10 @@ private struct Engine {
             dispatch(now: now)
         }
     }
+
+    /// Retry-After bounds for a full ledger, matching ``ClassAwarePolicy/Configuration/standard``.
+    static let ledgerRetryFloor: Int64 = 250
+    static let ledgerRetryCeiling: Int64 = 30_000
 
     /// Writes carry an idempotency key when the setup uses keys; reads never do (as with the Gateway).
     func keyed(_ i: Int) -> Bool {

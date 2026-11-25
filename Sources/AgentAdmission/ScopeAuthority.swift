@@ -66,6 +66,8 @@ public enum GrantIssueFailure: Error, Sendable, Equatable {
 public struct ScopeAuthority: Sendable {
     public let maxGrants: Int
     private var grants: [ScopeToken: SkillGrant] = [:]
+    /// Grants ordered by expiry, so a full authority reclaims expired grants without scanning.
+    private var expiries = ExpiryHeap<ScopeToken>()
 
     public init(maxGrants: Int = 10_000) {
         self.maxGrants = max(1, maxGrants)
@@ -81,7 +83,7 @@ public struct ScopeAuthority: Sendable {
     ) -> Result<ScopeToken, GrantIssueFailure> {
         guard !grant.capabilities.isEmpty else { return .failure(.emptyCapabilities) }
         guard now < grant.expiresAtMillis else { return .failure(.alreadyExpired) }
-        if grants.count >= maxGrants { purgeExpired(now: now) }
+        if grants.count >= maxGrants { reclaimExpired(now: now) }
         guard grants.count < maxGrants else { return .failure(.tooManyGrants) }
         var token = ScopeToken(rawValue: makeToken())
         // A colliding token source must never overwrite (and so re-scope) a live grant.
@@ -92,11 +94,14 @@ public struct ScopeAuthority: Sendable {
             token = ScopeToken(rawValue: makeToken() + "-\(attempts)")
         }
         grants[token] = grant
+        expiries.push(grant.expiresAtMillis, token)
+        compactIfMostlyStale()
         return .success(token)
     }
 
     public mutating func revoke(_ token: ScopeToken) {
         grants[token] = nil
+        compactIfMostlyStale()
     }
 
     public func authorize(
@@ -116,7 +121,23 @@ public struct ScopeAuthority: Sendable {
         return .success(grant)
     }
 
+    /// Full sweep; `issue` doesn't need it (it reclaims through the expiry heap).
     public mutating func purgeExpired(now: Int64) {
         grants = grants.filter { now < $0.value.expiresAtMillis }
+        compactIfMostlyStale()
+    }
+
+    private mutating func reclaimExpired(now: Int64) {
+        while let (expiresAt, token) = expiries.popExpired(now: now) {
+            if let grant = grants[token], grant.expiresAtMillis == expiresAt {
+                grants[token] = nil
+            }
+        }
+    }
+
+    private mutating func compactIfMostlyStale() {
+        guard expiries.count > 2 * grants.count + 64 else { return }
+        let snapshot = grants
+        expiries.compact { expiresAt, token in snapshot[token]?.expiresAtMillis == expiresAt }
     }
 }

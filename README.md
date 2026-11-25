@@ -97,7 +97,8 @@ A grant can be revoked at any time. If a request claims `.interactiveUI` with a 
 - **Duplicates replay or join.** A completed record replays until its TTL expires. A concurrent duplicate **joins** the in-flight execution instead of running again.
 - **Joining is bounded.** There are at most `maxWaitersPerKey` waiters, each waits at most `maxWaitMillis`, and cancelled waiters are removed. A waiter that stops waiting gets `.inProgress`, which tells the client to retry with the same key, never to start over.
 - **A different payload is a conflict.** The same key with a different payload fingerprint is a **conflict**. Replaying the old result for a new request would be silently wrong.
-- **Nothing unexpired is ever evicted, in flight or completed.** Evicting a completed record early would turn the retry of a lost response into a double charge. A full ledger sheds new writes instead of running them unprotected.
+- **Nothing unexpired is ever evicted, in flight or completed.** Evicting a completed record early would turn the retry of a lost response into a double charge. A full ledger sheds new writes instead of running them unprotected, with a `Retry-After` of the time until its earliest record expires (not a fixed 250 ms that would invite a retry storm), and counts them as `ledgerFull`.
+- **A full ledger stays cheap.** Expired records are reclaimed through an expiry heap, so a ledger that sits full under sustained load costs O(log n) per reclaimed record, never a table scan on the actor. Payload fingerprints are stored as a fixed 128-bit `FingerprintDigest`, so a record costs the same whatever the caller sent, and `IdempotencyKey` validates on decode as well as on init.
 
 **5. No `await` between "is this key known?" and "this key is mine".** `Gateway` is an actor, and actor reentrancy happens only at suspension points.
 
@@ -126,7 +127,7 @@ A grant can be revoked at any time. If a request claims `.interactiveUI` with a 
 | Another principal presents your key | They get a separate record and can't read your result |
 | Same key, different payload | `.rejected(.idempotencyConflict)`, and nothing runs |
 | Handler throws | Not cached. Joiners get the failure, and the next retry runs again |
-| Ledger full of unexpired records | The write is shed with a retry hint instead of running unprotected |
+| Ledger full of unexpired records | The write is shed (counted as `ledgerFull`) with `Retry-After` = time until a record expires, instead of running unprotected |
 | Client gave up while queued *(simulator)* | The work is skipped at dequeue. It never ran, so this is safe |
 | Token for another class or skill, expired, or revoked | Denied before anything else |
 | Inverted shed thresholds | `Gateway(validating:)` throws `GatewayConfigurationError` |
@@ -168,7 +169,7 @@ How to read the tables:
 - **`ok`** is rounded down to 0.1%, so `100%` means every intent succeeded.
 - **`dupExec`** counts handler runs beyond the first for one intent. On the class-aware side, every one of them is a **read** retried after a lost response. Reads carry no key, and re-running a read is harmless. Duplicate **writes** are 486 vs 0.
 
-Agent intents still fail under a 10× burst: 30.1% of Siri AI intents and 37.1% of Shortcuts intents. That is the design working as intended. They fail fast, before running, with an honest retry hint, instead of taking people down with them.
+Agent intents still fail under a 10× burst: 1,086 of 3,615 Siri AI intents (30.0%) and 398 of 1,074 Shortcuts intents (37.1%). That is the design working as intended. They fail fast, before running, with an honest retry hint, instead of taking people down with them.
 
 ### Tests that would fail against a broken implementation
 
@@ -230,7 +231,7 @@ if let fallback = FallbackPresenter.fallback(for: outcome, kind: .write, action:
 Add it with SwiftPM:
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/agent-traffic-admission-kit.git", from: "2.1.0")
+.package(url: "https://github.com/rajatslakhina/agent-traffic-admission-kit.git", from: "2.2.0")
 ```
 
 ## Honest limits
@@ -245,6 +246,7 @@ Add it with SwiftPM:
 - **Failures aren't cached.** That is correct only if the handler fails atomically. A handler that charges a card and then throws needs its own compensation. That's why the fallback text says "check before retrying".
 - **TTL must outlive the retry horizon, and capacity must cover peak writes × TTL.** A retry that arrives after its record expired runs again; `RetryPolicy.horizonMillis(...)` tells you the horizon to compare against. A full ledger sheds writes (fails closed) rather than evicting records.
 - **No lease on in-flight records.** A handler that never returns pins its key: retries get `.inProgress` indefinitely, the record holds a ledger slot, and it counts toward load. Bound handler time inside the handler; the ledger can't safely expire a claim whose work may still commit.
+- **`IntentKeyCache` evicts at capacity.** With more than `capacity` intents pending inside one window, the oldest pending one loses its key and a retry of it could run again. The default (256 per 2 minutes) is far above one device's traffic; size it if yours differs.
 - **`IntentKeyCache` is in-memory.** Inside its window it treats identical requests as one until you call `clear` on success. If the system retries your intent in a fresh process, persist the cache and keep `WallClock` (a backwards reading reuses the key, erring toward dedup).
 - **The live gateway has no wait queue.** It uses the count of executing handlers as its load signal, while the simulator models a real queue. The policy code is shared; only the load signal differs.
 - **Simulated, not load-tested.** The numbers come from the deterministic simulator, not a production fleet. They show the shape of the effect; they are not a capacity plan.
@@ -252,7 +254,7 @@ Add it with SwiftPM:
 
 ## Verification
 
-- `swift build -Xswiftc -warnings-as-errors` and `swift test` (94 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2.
+- `swift build -Xswiftc -warnings-as-errors` and `swift test` (104 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2.
 - CI runs on every push to `main`, every `v*` tag and every pull request, with three jobs:
   - macOS build and test, with warnings treated as errors
   - Linux build and test, in a Swift 6.0 container

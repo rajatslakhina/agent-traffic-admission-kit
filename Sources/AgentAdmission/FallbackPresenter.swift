@@ -9,7 +9,8 @@ public struct UserFacingFallback: Sendable, Equatable {
     /// Whole seconds to suggest waiting, rounded up, or `nil` when retrying won't help.
     public let retryAfterSeconds: Int?
     /// About **this attempt** only: `false` when the outcome proves it ran nothing, `true` when
-    /// the work is still in progress elsewhere and will run, `nil` when the outcome can't tell.
+    /// another execution of this intent is running and may complete, `nil` when the outcome
+    /// can't tell.
     public let mayHaveExecuted: Bool?
 }
 

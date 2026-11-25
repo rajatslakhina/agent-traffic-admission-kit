@@ -6,7 +6,8 @@ public struct GatewayRequest: Sendable {
     public let claimedCaller: CallerClass
     /// Required for writes. Reused on every retry of the same intent (see ``IntentKeyCache``).
     public let idempotencyKey: IdempotencyKey?
-    /// A stable digest of the payload. The same key with a different fingerprint is a conflict.
+    /// Identifies the payload: the same key with a different fingerprint is a conflict. Any
+    /// length is accepted; the gateway stores only a fixed-size ``FingerprintDigest`` of it.
     public let fingerprint: String
 
     public init(token: ScopeToken, capability: Capability, claimedCaller: CallerClass, idempotencyKey: IdempotencyKey?, fingerprint: String) {
@@ -56,6 +57,8 @@ public struct ClassCounters: Sendable, Equatable {
     public var replayed = 0
     /// Duplicates that stopped waiting for an in-flight execution (``GatewayOutcome/inProgress(retryAfterMillis:)``).
     public var inProgress = 0
+    /// Of `shed`, how many were because the idempotency ledger was full of live records.
+    public var ledgerFull = 0
     /// Times the handler actually ran.
     public var executed = 0
     /// Handler threw, counted once for the request that ran it and once per joiner it failed.
@@ -236,9 +239,12 @@ public actor Gateway<Value: Sendable> {
             )
         }
 
+        // Fixed-size, whatever the caller sent, so a record's cost doesn't depend on the request.
+        let fingerprint = FingerprintDigest.digest(request.fingerprint)
+
         // 3. Duplicates are served without admission: they cost a lookup, not a handler run.
         if let ledgerKey {
-            switch ledger.lookup(ledgerKey, fingerprint: request.fingerprint, now: now) {
+            switch ledger.lookup(ledgerKey, fingerprint: fingerprint, now: now) {
             case let .replay(value):
                 bump(traffic) { $0.replayed += 1 }
                 return .success(value, replayed: true)
@@ -255,11 +261,16 @@ public actor Gateway<Value: Sendable> {
         // 4. Claim the key first, so a full ledger sheds before the policy spends a token.
         //    No `await` since step 3, so nobody else can have claimed it.
         if let ledgerKey {
-            switch ledger.begin(ledgerKey, fingerprint: request.fingerprint, now: now) {
+            switch ledger.begin(ledgerKey, fingerprint: fingerprint, now: now) {
             case .started:
                 break
-            case .full, .alreadyPresent:
-                // Not executed, so telling the client to come back is safe.
+            case .full:
+                // Not executed, so telling the client to come back is safe. A full ledger only
+                // frees up when a record expires, so the hint is that time, not a fixed 250 ms.
+                bump(traffic) { $0.shed += 1; $0.ledgerFull += 1 }
+                let wait = ledger.millisUntilReclaim(now: now) ?? configuration.policy.maxRetryAfterMillis
+                return .shed(.overloaded, retryAfterMillis: clampedRetry(wait))
+            case .alreadyPresent:
                 bump(traffic) { $0.shed += 1 }
                 return .shed(.overloaded, retryAfterMillis: retryHint)
             }
@@ -305,6 +316,10 @@ public actor Gateway<Value: Sendable> {
     // MARK: Joining an in-flight execution
 
     private var retryHint: Int64 { max(1, configuration.policy.minRetryAfterMillis) }
+
+    private func clampedRetry(_ millis: Int64) -> Int64 {
+        Saturating.clamp(millis, retryHint, max(retryHint, configuration.policy.maxRetryAfterMillis))
+    }
 
     /// Waits for the in-flight execution of `key`, bounded in count, time and by cancellation.
     private func join(_ key: LedgerKey, traffic: TrafficClass) async -> GatewayOutcome<Value> {

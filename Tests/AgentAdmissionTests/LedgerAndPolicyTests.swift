@@ -51,8 +51,8 @@ final class IdempotencyLedgerTests: XCTestCase {
         guard case .absent = ledger.lookup(key("paid"), fingerprint: "f", now: 1_000) else { return XCTFail("expired") }
     }
 
-    /// While nothing has expired, a full ledger must refuse in O(1), not rescan on every call.
-    func testFullLedgerDoesNotRescanUntilSomethingCanExpire() {
+    /// A full ledger must refuse without scanning the table, and reclaim an expired slot without one too.
+    func testFullLedgerRefusesWithoutScanningAndReclaimsOnExpiry() {
         var ledger = IdempotencyLedger<Int, Int>(capacity: 2, ttlMillis: 1_000)
         for k in 0..<2 {
             _ = ledger.begin(k, fingerprint: "", now: 0)
@@ -60,8 +60,38 @@ final class IdempotencyLedgerTests: XCTestCase {
         }
         for i in 0..<100 { XCTAssertEqual(ledger.begin(100 + i, fingerprint: "", now: 500), .full) }
         XCTAssertEqual(ledger.purgeScans, 0)
+        // Once a record expires its slot is reclaimed through the expiry heap, still without a scan.
         XCTAssertEqual(ledger.begin(999, fingerprint: "", now: 1_000), .started)
-        XCTAssertEqual(ledger.purgeScans, 1)
+        XCTAssertEqual(ledger.purgeScans, 0)
+    }
+
+    /// The saturated steady state: the ledger stays full while records expire one by one and
+    /// new writes take their slots. Reclaiming must come from the expiry heap, never a scan.
+    func testSaturatedLedgerReclaimsWithoutEverScanningTheTable() {
+        // TTL equals capacity in ms, so with one write per ms exactly one record expires per step.
+        var ledger = IdempotencyLedger<Int, Int>(capacity: 100, ttlMillis: 100)
+        for k in 0..<100 {
+            XCTAssertEqual(ledger.begin(k, fingerprint: "", now: Int64(k)), .started)
+            ledger.complete(k, value: k, now: Int64(k))
+        }
+        for step in 0..<1_000 {
+            let now = Int64(100 + step)
+            // The record completed 100 ms ago (an original, or an earlier refill) has just expired.
+            XCTAssertEqual(ledger.begin(10_000 + step, fingerprint: "", now: now), .started, "step \(step)")
+            ledger.complete(10_000 + step, value: step, now: now)
+            XCTAssertLessThanOrEqual(ledger.count, 100)
+        }
+        XCTAssertEqual(ledger.purgeScans, 0)
+    }
+
+    func testMillisUntilReclaimPointsAtTheEarliestExpiry() {
+        var ledger = IdempotencyLedger<Int, Int>(capacity: 2, ttlMillis: 1_000)
+        XCTAssertNil(ledger.millisUntilReclaim(now: 0))
+        _ = ledger.begin(1, fingerprint: "", now: 0)
+        XCTAssertNil(ledger.millisUntilReclaim(now: 0), "in-flight records have no expiry")
+        ledger.complete(1, value: 1, now: 200)
+        XCTAssertEqual(ledger.millisUntilReclaim(now: 500), 700)
+        XCTAssertEqual(ledger.millisUntilReclaim(now: 5_000), 0)
     }
 
     func testAbandonFreesAnInFlightKeyButNotACompletedOne() {
@@ -180,6 +210,11 @@ final class ShedOrderAuditTests: XCTestCase {
         XCTAssertFalse(ShedOrderAudit.audit { ClassAwarePolicy(configuration: config, now: 0) }.isEmpty)
     }
 
+    func testAuditClampsAHostileDepthInsteadOfRunningAway() {
+        XCTAssertEqual(ShedOrderAudit.audit(maxDepth: .max) { ClassBlindFIFOPolicy(queueCapacity: 16) }, [])
+        XCTAssertEqual(ShedOrderAudit.audit(maxDepth: .min) { ClassAwarePolicy(now: 0) }, [])
+    }
+
     func testClassBlindBaselineIsOrderNeutralSoTheAuditPassesIt() {
         // Documented: FIFO never sheds one tier while admitting another, it just doesn't prefer anyone.
         XCTAssertEqual(ShedOrderAudit.audit { ClassBlindFIFOPolicy(queueCapacity: 16) }, [])
@@ -229,6 +264,30 @@ final class ScopeAuthorityTests: XCTestCase {
         let second = try authority.issue(grant(.siriAgent), now: 0) { "same" }.get()
         XCTAssertNotEqual(first, second)
         XCTAssertEqual(try authority.authorize(first, capability: menu, claimedCaller: .interactiveUI, now: 1).get().caller, .interactiveUI)
+    }
+
+    func testAFullAuthorityReclaimsExpiredGrantsAsTheyLapse() throws {
+        var authority = ScopeAuthority(maxGrants: 3)
+        for i in 0..<3 {
+            _ = try authority.issue(grant(expires: Int64(100 + i)), now: 0).get()
+        }
+        XCTAssertEqual(authority.issue(grant(expires: 500), now: 50), .failure(.tooManyGrants))
+        // One grant lapses at 100: exactly one slot frees up.
+        XCTAssertNotNil(try? authority.issue(grant(expires: 500), now: 100).get())
+        XCTAssertEqual(authority.issue(grant(expires: 500), now: 100), .failure(.tooManyGrants))
+        XCTAssertEqual(authority.grantCount, 3)
+    }
+
+    func testRevokedThenReissuedTokenIsNotReclaimedByItsOldExpiry() throws {
+        var authority = ScopeAuthority(maxGrants: 2)
+        let a = try authority.issue(grant(expires: 100), now: 0) { "A" }.get()
+        authority.revoke(a)
+        let again = try authority.issue(grant(expires: 1_000), now: 0) { "A" }.get()
+        XCTAssertEqual(again, a)
+        _ = try authority.issue(grant(expires: 1_000), now: 0) { "B" }.get()
+        // At 100 the stale (100, "A") heap entry pops; the live "A" (expiring at 1000) must survive.
+        XCTAssertEqual(authority.issue(grant(expires: 1_000), now: 100), .failure(.tooManyGrants))
+        XCTAssertNotNil(try? authority.authorize(a, capability: menu, claimedCaller: .siriAgent, now: 100).get())
     }
 
     func testTokenDescriptionDoesNotLeakTheSecret() {

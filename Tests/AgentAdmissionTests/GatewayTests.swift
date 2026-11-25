@@ -281,12 +281,49 @@ final class GatewayTests: XCTestCase {
             GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: .mint(), fingerprint: fp)
         }
         guard case .success = await gateway.handle(write("a"), operation: { 1 }) else { return XCTFail("first write") }
-        // Ledger holds a's live record: b is shed by the ledger...
-        guard case .shed(.overloaded, _) = await gateway.handle(write("b"), operation: { 2 }) else { return XCTFail("b should be shed") }
+        // Ledger holds a's live record: b is shed by the ledger, told to come back when a expires...
+        let b = await gateway.handle(write("b"), operation: { 2 })
+        guard case .shed(.overloaded, retryAfterMillis: 1_000) = b else { return XCTFail("b should be shed until a expires, got \(b)") }
+        let counters = await gateway.countersByClass()[TrafficClass(.siriAgent, .write)]
+        XCTAssertEqual(counters?.ledgerFull, 1)
         clock.advance(byMillis: 1_000)
         // ...and must not have spent the bucket's second (last) token.
         let c = await gateway.handle(write("c"), operation: { 3 })
         guard case .success(3, replayed: false) = c else { return XCTFail("c should run with the unspent token, got \(c)") }
+    }
+
+    /// Without the abandon on a policy shed, the shed write's claim would pin its key forever.
+    func testPolicyShedOfAKeyedWriteReleasesTheClaim() async throws {
+        var config = Gateway<Int>.Configuration()
+        config.policy.buckets = [TrafficClass(.siriAgent, .write): BucketSpec(capacity: 1, refillPerSecond: 1)]
+        let (gateway, clock) = makeGateway(config)
+        let tok = try await token(gateway, caller: .siriAgent, caps: [reorder])
+        let probe = Probe()
+        let first = GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: .mint(), fingerprint: "a")
+        let second = GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: .mint(), fingerprint: "b")
+        _ = await gateway.handle(first) { 1 }
+        guard case .shed(.rateLimited, _) = await gateway.handle(second, operation: { await probe.enter(); return 2 }) else {
+            return XCTFail("second should be rate limited")
+        }
+        let ledgerCount = await gateway.ledgerCount
+        XCTAssertEqual(ledgerCount, 1, "the shed write must leave no record behind")
+        clock.advance(byMillis: 1_000)
+        let retry = await gateway.handle(second) { await probe.enter(); return 2 }
+        guard case .success(2, replayed: false) = retry else { return XCTFail("retry should run fresh, got \(retry)") }
+        let runs = await probe.runs
+        XCTAssertEqual(runs, 1)
+    }
+
+    func testOversizedFingerprintsCostAFixedSizeRecordAndStillDetectConflicts() async throws {
+        let (gateway, _) = makeGateway()
+        let tok = try await token(gateway, caller: .siriAgent, caps: [reorder])
+        let key = IdempotencyKey.mint()
+        let huge = String(repeating: "p", count: 200_000)
+        _ = await gateway.handle(GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: key, fingerprint: huge)) { 1 }
+        let same = await gateway.handle(GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: key, fingerprint: huge)) { 2 }
+        guard case .success(1, replayed: true) = same else { return XCTFail("got \(same)") }
+        let other = await gateway.handle(GatewayRequest(token: tok, capability: reorder, claimedCaller: .siriAgent, idempotencyKey: key, fingerprint: huge + "!")) { 3 }
+        guard case .rejected(.idempotencyConflict) = other else { return XCTFail("got \(other)") }
     }
 
     func testRelativeIssueExpiresOnTheGatewaysOwnClock() async throws {
@@ -429,6 +466,7 @@ final class FallbackPresenterTests: XCTestCase {
 
     func testInProgressPromisesNoDoubleRunAndDoesNotClaimNothingHappened() {
         let f = FallbackPresenter.fallback(for: GatewayOutcome<Int>.inProgress(retryAfterMillis: 250), kind: .write, action: "place your order")
+        XCTAssertTrue(f?.spoken.contains("won't start it again while it's running") ?? false)
         XCTAssertEqual(f?.mayHaveExecuted, true)
         XCTAssertEqual(f?.retryAfterSeconds, 1)
         XCTAssertFalse(f?.spoken.contains("didn't go through") ?? true)

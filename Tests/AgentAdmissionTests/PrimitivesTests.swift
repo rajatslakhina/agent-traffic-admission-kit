@@ -125,6 +125,14 @@ final class RetryPolicyTests: XCTestCase {
         XCTAssertEqual(policy.horizonMillis(perAttemptTimeoutMillis: .max, maxRetryAfterMillis: .max), .max)
     }
 
+    func testDefaultLedgerTTLOutlivesTheWellBehavedAgentsRetryHorizon() {
+        let horizon = RetryPolicy.wellBehavedAgent.horizonMillis(
+            perAttemptTimeoutMillis: TrafficProfile.launchDay.clientTimeoutMillis,
+            maxRetryAfterMillis: ClassAwarePolicy.Configuration.standard.maxRetryAfterMillis
+        )
+        XCTAssertGreaterThan(Gateway<Int>.Configuration().ledgerTTLMillis, horizon)
+    }
+
     func testHorizonCoversEveryWaitAndEveryAttempt() {
         let policy = RetryPolicy(maxAttempts: 3, baseDelayMillis: 100, maxDelayMillis: 1_000, honoursRetryAfter: false, jitterFraction: 0)
         // timeout + 100 + timeout + 200 + timeout
@@ -158,7 +166,29 @@ final class BinaryHeapTests: XCTestCase {
     }
 }
 
+final class FingerprintDigestTests: XCTestCase {
+    func testDigestIsFixedSizeAndSeparatesDifferentPayloads() {
+        let long = String(repeating: "x", count: 1_000_000)
+        XCTAssertEqual(FingerprintDigest.digest(long).count, 32)
+        XCTAssertEqual(FingerprintDigest.digest("").count, 32)
+        XCTAssertEqual(FingerprintDigest.digest("latte"), FingerprintDigest.digest("latte"))
+        XCTAssertNotEqual(FingerprintDigest.digest("latte"), FingerprintDigest.digest("espresso"))
+        XCTAssertNotEqual(FingerprintDigest.digest(long), FingerprintDigest.digest(long + "y"))
+    }
+}
+
 final class IdempotencyKeyTests: XCTestCase {
+    func testDecodingAppliesTheSameValidationAsTheInitializer() throws {
+        let decoder = JSONDecoder()
+        for bad in ["\"\"", "\"a b\"", "\"" + String(repeating: "a", count: 129) + "\""] {
+            XCTAssertThrowsError(try decoder.decode(IdempotencyKey.self, from: Data(bad.utf8)), bad)
+        }
+        let key = IdempotencyKey.mint()
+        let data = try JSONEncoder().encode(key)
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), "\"\(key.rawValue)\"")
+        XCTAssertEqual(try decoder.decode(IdempotencyKey.self, from: data), key)
+    }
+
     func testValidation() {
         XCTAssertNil(IdempotencyKey(""))
         XCTAssertNil(IdempotencyKey("has space"))

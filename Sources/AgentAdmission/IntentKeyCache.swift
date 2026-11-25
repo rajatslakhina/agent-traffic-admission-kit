@@ -10,6 +10,11 @@
 /// the first hasn't been cleared are treated as one. Clear on success to keep the window to
 /// "retries of an unfinished intent".
 ///
+/// Capacity limit: when `capacity` signatures are live at once, adding another evicts the
+/// oldest live one, and a later retry of *that* intent gets a new key (so it could run twice).
+/// Size `capacity` above the number of distinct intents that can be pending inside one window;
+/// the default (256 within 2 minutes) is far above what one user's device produces.
+///
 /// Honest limit: this is in-memory, so it lives as long as the process. If the system runs
 /// your intent in a fresh process for a retry, persist entries (e.g. in an app-group
 /// `UserDefaults`) with the same semantics, and feed it ``WallClock`` (not ``MonotonicClock``,

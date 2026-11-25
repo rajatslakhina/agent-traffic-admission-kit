@@ -55,6 +55,8 @@ final class LaunchDaySimulationTests: XCTestCase {
         XCTAssertEqual(Self.naive.aggregate(.siriAgent).successPercentText, "40.9%")
         XCTAssertEqual(Self.aware.aggregate(.siriAgent).successPercentText, "69.9%")
         XCTAssertEqual(Self.aware.aggregate(.shortcut).successPercentText, "62.9%")
+        XCTAssertEqual(Self.aware.aggregate(.siriAgent).failed, 1_086)   // README: 30.0% of 3,615
+        XCTAssertEqual(Self.aware.aggregate(.shortcut).failed, 398)      // README: 37.1% of 1,074
         XCTAssertEqual(Self.naive.summary(), Self.naiveSummary)
         XCTAssertEqual(Self.aware.summary(), Self.awareSummary)
     }

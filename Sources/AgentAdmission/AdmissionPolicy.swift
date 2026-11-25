@@ -189,11 +189,14 @@ public enum ShedOrderAudit {
         }
     }
 
-    /// - Parameter makePolicy: builds a fresh policy for each probe so token buckets never interfere.
+    /// - Parameters:
+    ///   - maxDepth: deepest load to probe, clamped to `0...100_000` so a hostile value can't run away.
+    ///   - makePolicy: builds a fresh policy for each probe so token buckets never interfere.
     public static func audit<P: AdmissionPolicy>(
         maxDepth: Int = 512,
         makePolicy: () -> P
     ) -> [Violation] {
+        let maxDepth = min(max(0, maxDepth), 100_000)
         var violations: [Violation] = []
         let representative: [ShedTier: TrafficClass] = [
             .agentRead: TrafficClass(.siriAgent, .read),
@@ -201,7 +204,7 @@ public enum ShedOrderAudit {
             .agentWrite: TrafficClass(.siriAgent, .write),
             .interactive: TrafficClass(.interactiveUI, .write)
         ]
-        for depth in 0...max(0, maxDepth) {
+        for depth in 0...maxDepth {
             var admittedTiers: [ShedTier: Bool] = [:]
             for tier in ShedTier.allCases {
                 guard let traffic = representative[tier] else { continue }
