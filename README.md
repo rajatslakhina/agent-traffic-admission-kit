@@ -10,10 +10,10 @@ Demo app: (added after the companion repo is pushed — see below)
 | Launch-day burst, same traffic, same 8 workers | Sized for taps (class-blind FIFO) | **AgentAdmission** (class-aware) |
 |---|---|---|
 | Interactive UI p99 | 4,255 ms | **92 ms** |
-| Interactive UI intents that succeeded | 73% | **100%** |
+| Interactive UI intents that succeeded | 73.2% | **100%** |
 | Interactive UI requests shed | 1,395 | **0** |
 | Writes executed more than once (double charges) | 486 | **0** |
-| Siri AI intents that succeeded | 41% | **70%** |
+| Siri AI intents that succeeded | 40.9% | **70.0%** |
 
 *From `LaunchDaySimulator.run(profile: .launchDay, …)`; the test suite asserts the SLO and the zero, and the full tables are [below](#the-numbers).*
 
@@ -88,24 +88,24 @@ The order is a checked invariant, not a comment: `ShedOrderAudit` probes a polic
 `setup: .sizedForTaps`: class-blind FIFO (256 deep), no keys, agents retry every 200 ms with no jitter.
 
 ```
-caller         intents  ok%    p50   p99  shed  timeout  replayed  dropped  dupExec
-interactiveUI   4312  73  40  4255  1395  1063  0  0  372
-widget          813  70  40  1481  137  101  0  0  0
-shortcut        1074  42  447  6485  1769  743  0  0  379
-siriAgent       3615  41  521  6435  6138  2494  0  0  1253
+caller         intents  ok     p50   p99  shed  timeout  replayed  dropped  dupExec
+interactiveUI   4312  73.2%  40  4255  1395  1063  0  0  372
+widget          813  70.7%  40  1481  137  101  0  0  0
+shortcut        1074  42.1%  447  6485  1769  743  0  0  379
+siriAgent       3615  40.9%  521  6435  6138  2494  0  0  1253
 ```
 
 `setup: .classAware`: this package. Ordered shedding and buckets, keys, agents honour `Retry-After` with exponential backoff and 50% jitter.
 
 ```
-caller         intents  ok%    p50   p99  shed  timeout  replayed  dropped  dupExec
-interactiveUI   4312  100  40  92  0  20  20  0  0
-widget          813  99  40  90  0  5  0  0  0
-shortcut        1074  63  101  2549  2149  3  3  0  0
-siriAgent       3615  70  86  2488  6118  16  13  0  0
+caller         intents  ok     p50   p99  shed  timeout  replayed  dropped  dupExec
+interactiveUI   4312  100%  40  92  0  20  20  0  0
+widget          813  99.3%  40  90  0  5  0  0  0
+shortcut        1074  63.3%  101  2549  2149  3  3  0  0
+siriAgent       3615  70.0%  86  2488  6118  16  13  0  0
 ```
 
-Latencies are milliseconds from the intent's first attempt to its success. `dupExec` counts handler runs beyond the first for one intent (reads and writes); writes alone are 486 vs 0. Agent intents still fail under a 10× burst, about 30% of them, and that's the design working as intended: they fail fast, before execution, with an honest retry hint, instead of taking people down with them.
+Latencies are milliseconds from the intent's first attempt to its success; `ok` is rounded down to 0.1%, so `100%` means every intent succeeded. `dupExec` counts handler runs beyond the first for one intent (reads and writes); writes alone are 486 vs 0. Agent intents still fail under a 10× burst, about 30% of them, and that's the design working as intended: they fail fast, before execution, with an honest retry hint, instead of taking people down with them.
 
 ### Tests that would fail against a broken implementation
 
@@ -165,7 +165,7 @@ Add it with SwiftPM:
 
 ## Verification
 
-- `swift build -Xswiftc -warnings-as-errors` and `swift test` (69 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2, and both run in CI on every push.
+- `swift build -Xswiftc -warnings-as-errors` and `swift test` (71 XCTest cases) run clean from an empty `.build` on Xcode 27.2 / Swift 6.4.2, and both run in CI on every push.
 - CI also builds the package for iOS with `xcodebuild … -destination 'generic/platform=iOS Simulator'`.
 - See the [Actions tab](https://github.com/rajatslakhina/agent-traffic-admission-kit/actions) for each job's current result.
 

@@ -40,7 +40,7 @@ public enum FallbackPresenter {
             }
         case .denied:
             return UserFacingFallback(
-                spoken: "This shortcut isn't allowed to \(action). Open the app to do it there.",
+                spoken: "I'm not allowed to \(action) from here. Open the app to do it there.",
                 visual: "Not allowed from here. Open the app.",
                 retryAfterSeconds: nil,
                 mayHaveExecuted: false

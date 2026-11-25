@@ -168,3 +168,19 @@ final class IdempotencyKeyTests: XCTestCase {
         XCTAssertNotEqual(IdempotencyKey.mint(), IdempotencyKey.mint())
     }
 }
+
+final class SuccessPercentTextTests: XCTestCase {
+    func testRoundsDownSoNearlyPerfectNeverShowsAsPerfect() {
+        var r = ClassReport(traffic: TrafficClass(.interactiveUI, .read))
+        XCTAssertEqual(r.successPercentText, "100%")
+        r.intents = 10_000
+        r.succeeded = 9_996
+        XCTAssertEqual(r.successPercentText, "99.9%")
+        r.succeeded = 10_000
+        XCTAssertEqual(r.successPercentText, "100%")
+        r.succeeded = 4_097
+        XCTAssertEqual(r.successPercentText, "40.9%")
+        r.succeeded = 0
+        XCTAssertEqual(r.successPercentText, "0.0%")
+    }
+}

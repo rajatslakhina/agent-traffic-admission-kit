@@ -148,6 +148,14 @@ public struct ClassReport: Sendable, Equatable, Identifiable {
     public var failed: Int { intents - succeeded }
     public var successRate: Double { intents == 0 ? 1 : Double(succeeded) / Double(intents) }
     public func percentile(_ p: Double) -> Int64? { Percentile.nearestRank(latencies, p) }
+    /// Success rate for display, rounded **down** to 0.1%, so "100%" appears only when every
+    /// intent succeeded and a 99.96% run can't round itself up to perfect.
+    public var successPercentText: String {
+        guard intents > 0, succeeded < intents else { return "100%" }
+        let tenths = (succeeded * 1_000) / intents
+        return "\(tenths / 10).\(tenths % 10)%"
+    }
+
     public var p50: Int64? { percentile(0.50) }
     public var p99: Int64? { percentile(0.99) }
 
@@ -209,13 +217,12 @@ public struct SimulationReport: Sendable, Equatable {
     /// A plain-text table, one row per caller class, for logs and the README.
     public func summary() -> String {
         var lines = ["\(setupName): utilization \(Int((utilization * 100).rounded()))%, duplicate writes \(duplicateWriteExecutions)"]
-        lines.append("caller         intents  ok%    p50   p99  shed  timeout  replayed  dropped  dupExec")
+        lines.append("caller         intents  ok     p50   p99  shed  timeout  replayed  dropped  dupExec")
         for caller in CallerClass.allCases {
             let r = aggregate(caller)
-            let ok = r.intents == 0 ? 100 : Int((r.successRate * 1000).rounded()) / 10
             let cols: [String] = [
                 caller.rawValue.padding(toLength: 14, withPad: " ", startingAt: 0),
-                String(r.intents), "\(ok)", r.p50.map(String.init) ?? "-", r.p99.map(String.init) ?? "-",
+                String(r.intents), r.successPercentText, r.p50.map(String.init) ?? "-", r.p99.map(String.init) ?? "-",
                 String(r.shed), String(r.timedOut), String(r.replayed), String(r.droppedExpired), String(r.duplicateExecutions)
             ]
             lines.append(cols.joined(separator: "  "))

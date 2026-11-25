@@ -257,6 +257,12 @@ final class FallbackPresenterTests: XCTestCase {
         XCTAssertFalse(f?.spoken.contains("Nothing was changed") ?? true)
     }
 
+    func testDenialDoesNotAssumeTheCallerIsAShortcut() {
+        let f = FallbackPresenter.fallback(for: GatewayOutcome<Int>.denied(.expired), kind: .write, action: "place your order")
+        XCTAssertEqual(f?.spoken, "I'm not allowed to place your order from here. Open the app to do it there.")
+        XCTAssertEqual(f?.mayHaveExecuted, false)
+    }
+
     func testSuccessHasNoFallback() {
         XCTAssertNil(FallbackPresenter.fallback(for: GatewayOutcome<Int>.success(1, replayed: false), kind: .write, action: "x"))
     }
